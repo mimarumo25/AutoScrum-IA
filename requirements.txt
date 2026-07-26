@@ -1,0 +1,17 @@
+# v0 del plano de control: SOLO biblioteca estandar.
+# - tomllib requiere Python >= 3.11 (ya en la stdlib; no se instala)
+# - los checkers de andamiaje (gates/check_*.py) usan solo stdlib
+# Por eso este archivo esta practicamente vacio: `make demo` no necesita nada.
+#
+# Primera dependencia real cuando aterrice G0 (validar 00_intake.yaml):
+PyYAML>=6.0
+#
+# Modo REAL (agentes que llaman a un modelo):
+# - Proveedor Anthropic: SDK oficial.
+# - Proveedores chinos (DeepSeek/Qwen/GLM/Kimi): compatibles con OpenAI, sin
+#   dependencia extra (providers.py usa urllib de la stdlib).
+anthropic>=0.40
+#
+# Los gates de produccion NO son paquetes pip; se instalan aparte:
+#   npm i -g @stoplight/spectral-cli @mermaid-js/mermaid-cli
+#   gitleaks, semgrep, k6, docker  (gestores del sistema)

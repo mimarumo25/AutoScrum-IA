@@ -1,0 +1,106 @@
+[runtime]
+# Plantilla de invocación del agente. Placeholders reales: {py} {root} {node} {workdir}.
+# ({prompt} y {task} se sustituyen si aparecen, pero agent_cmd NO los usa: el agente
+#  resuelve su prompt por {node} y lee su tarea de .agent/current_task.json. No los
+#  metas en el comando esperando que el modelo los reciba por ahí.)
+# {py} = intérprete de Python actual (portable win/*nix). El comando se tokeniza con
+# shlex.split (sin shell), así que no uses expansiones de shell aquí.
+# Agente real: lee la idea + estado del repo + su tarea + defectos, llama al proveedor
+# LLM (Anthropic o modelo chino, ver providers.py) y escribe archivos en sus paths.
+# El proveedor y la key se eligen por variables de entorno (SDD_PROVIDER, *_API_KEY).
+agent_cmd = "{py} {root}/agent.py {node} {workdir}"
+# Comando usado por `--simulate`: no consume tokens, sirve para probar el plano de control.
+simulate_cmd = "{py} {root}/examples/fake_agent.py {node} {workdir}"
+
+[budget]
+max_retries_per_gate = 2      # tras esto, ESCALATE_HUMAN
+max_agent_calls = 120         # techo duro de la ejecución completa (bucle de tareas incluido)
+max_wall_minutes = 180
+max_defect_tasks = 12         # tope de tareas de defecto generadas; evita ping-pong infinito
+max_output_tokens = 0         # techo de tokens de salida (0 = sin techo). En modo real
+                              # el orquestador escala si se supera; en simulado no aplica.
+
+# --- Nodos del grafo -------------------------------------------------------
+# writes: paths sobre los que el nodo PUEDE escribir. Todo lo demás es violación
+#   de propiedad y lo revierte el supervisor (gate G7).
+# must_produce: globs que el nodo DEBE dejar escritos y no vacíos (gate G0). Sin
+#   esto, un agente que muere sin escribir nada pasa todos los gates: no hay
+#   artefacto que reprobar. Los nodos de tarea no lo declaran aquí — sus
+#   entregables los fija cada tarea en spec/30_plan/tasks.yaml.
+# task_node: el nodo no tiene turno fijo en la cadena; el bucle de tareas lo
+#   invoca una vez por cada tarea que le asigne el plan.
+
+[[node]]
+id = "product"
+prompt = "agents/product.md"
+writes = ["spec/10_product/"]
+must_produce = ["spec/10_product/prd.md", "spec/10_product/features/*.feature"]
+gates = ["G0", "G1", "R1"]
+next = "architect"
+
+[[node]]
+id = "architect"
+prompt = "agents/architect.md"
+# El arquitecto posee la especificacion Y el esqueleto de build en la raiz. Antes
+# nadie era dueno de package.json/tsconfig/linter-config: el planner intentaba
+# asignarlos a dev_backend, G10 los rechazaba (fuera de su propiedad) y el
+# proyecto quedaba sin manifiesto, imposible de instalar. Que los posea el
+# arquitecto ademas ENFORCE la regla de CLAUDE.md: los Dev no pueden relajar
+# tsconfig/.eslintrc porque no son suyos (G7 lo revierte).
+writes = [
+  "spec/20_arch/",
+  "package.json", "package-lock.json", "tsconfig", ".eslintrc", ".prettierrc",
+  ".npmrc", "jest.config", "vitest.config", "playwright.config",
+  "pyproject.toml", "requirements.txt", "ruff.toml", "pytest.ini", "setup.cfg",
+  "go.mod", "go.sum", "Cargo.toml",
+]
+must_produce = [
+  "spec/20_arch/nfr.yaml",
+  "spec/20_arch/api/openapi.yaml",
+  "spec/20_arch/env-contract.yaml",
+  "spec/20_arch/threat-model.md",
+  "spec/20_arch/toolchain.yaml",
+]
+gates = ["G0", "G2", "R1"]
+next = "planner"
+
+[[node]]
+id = "planner"
+prompt = "agents/planner.md"
+writes = ["spec/30_plan/"]
+must_produce = ["spec/30_plan/tasks.yaml"]
+gates = ["G0", "G10", "R1"]
+next = "human_gate"
+
+[[node]]
+id = "human_gate"
+type = "human"
+prompt = ""
+writes = []
+gates = []
+next = "task_loop"
+
+[[node]]
+id = "dev_backend"
+prompt = "agents/dev_backend.md"
+task_node = true
+writes = ["src/api/", "src/domain/", "src/infra/", "migrations/", ".env.example", "spec/20_arch/env-contract.yaml"]
+gates = ["G7", "G0", "G4", "G5", "G6", "R2"]
+next = "task_loop"
+
+[[node]]
+id = "dev_frontend"
+prompt = "agents/dev_frontend.md"
+task_node = true
+writes = ["src/web/", ".env.example"]
+gates = ["G7", "G0", "G4", "G5", "G6", "R2"]
+next = "task_loop"
+
+[[node]]
+id = "qa"
+prompt = "agents/qa.md"
+task_node = true
+writes = ["tests/", "spec/40_qa/"]
+must_produce = ["spec/40_qa/traceability.md"]
+gates = ["G7", "G0", "G6", "G8", "G9", "R2"]
+next = "task_loop"

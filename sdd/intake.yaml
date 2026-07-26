@@ -1,0 +1,43 @@
+intake_version: 1
+id: IDEA-2026-001
+title: Portal de reinscripcion por acudiente
+problem: >
+  Las reinscripciones se gestionan por WhatsApp; el administrador reconcilia a
+  mano y se pierde el 15% de renovaciones.
+target_users:
+  - persona: acudiente
+    contexto: movil Android, conectividad intermitente
+    dolor: no sabe si el pago quedo registrado
+  - persona: administrador de sede
+    contexto: escritorio, jornada partida
+    dolor: reconciliacion manual en hoja de calculo
+scope:
+  in: [renovacion de matricula, comprobante de pago, notificacion al acudiente]
+  out: [facturacion electronica, nomina de entrenadores]
+non_goals: [reemplazar la pasarela de pagos actual]
+success_metrics:
+  - metrica: renovaciones completadas sin intervencion manual
+    baseline: 0%
+    objetivo: 70% en 90 dias
+constraints:
+  presupuesto_infra_usd_mes: 40        # requerido por G0
+  latencia_p95_ms: 800                 # requerido por G0
+  usuarios_concurrentes_pico: 150
+  plazo_semanas: 6
+  stack_impuesto: [PostgreSQL]         # lista vacia = decide el arquitecto
+  integraciones_obligatorias: [Wompi]
+  compliance: [Ley 1581 de 2012, tratamiento de datos de menores]
+  region_datos: Colombia
+data:
+  entidades_clave: [tenant, sede, estudiante, acudiente, matricula, pago]
+  multi_tenant: true
+  volumen_12m: {estudiantes: 5000, pagos_mes: 4000}
+  sensibilidad: [PII, datos de menores]   # requerido por G0
+existing_repo: git@github.com:org/athelos.git
+target_branch: feat/reinscripcion
+unknowns:
+  - la conciliacion de pagos es por webhook o por consulta programada
+  - un estudiante puede tener dos acudientes con permisos distintos
+acceptance_of_done:
+  - un acudiente renueva y recibe comprobante sin contactar a la sede
+  - el administrador ve el estado de renovacion por sede

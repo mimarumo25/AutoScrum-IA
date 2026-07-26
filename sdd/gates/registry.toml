@@ -1,0 +1,105 @@
+# Contrato de todo checker: imprime en stdout {"findings":[{file,line,rule,evidence}]}
+# y sale con codigo 1 si findings no esta vacio. Nada mas. Sin prosa, sin sugerencias.
+# Placeholders disponibles: {py} {workdir} {gates} {root} {node}
+# {py} = interprete de Python actual (portable win/*nix); antes era "python3" fijo.
+#
+# route_by decide a quien se le devuelve el defecto:
+#   "path" -> al dueno del path del hallazgo (pipeline.toml [[node]].writes)
+#   "gate" -> siempre a default_owner
+#   "node" -> al nodo que acaba de correr (el hallazgo es sobre SU ejecucion)
+
+[[gate]]
+id = "G0"
+name = "entregable declarado presente"
+# Cierra el agujero del verde-sobre-el-vacio: los demas gates inspeccionan
+# artefactos, y sin artefactos no tienen nada que reprobar.
+route_by = "node"
+cmd = "{py} {gates}/check_deliverable.py --workdir {workdir} --node {node} --pipeline {root}/pipeline.toml"
+default_owner = "product"
+
+[[gate]]
+id = "G1"
+name = "trazabilidad de requerimientos"
+route_by = "gate"
+cmd = "{py} {gates}/check_traceability.py --mode product --workdir {workdir}"
+default_owner = "product"
+
+[[gate]]
+id = "G2"
+name = "coherencia de especificacion tecnica"
+route_by = "gate"
+cmd = "{py} {gates}/check_arch_spec.py --workdir {workdir}"
+default_owner = "architect"
+
+[[gate]]
+id = "G4"
+name = "estatico y tamano de archivo"
+# En un repo real se sustituye por: eslint / ruff / tsc --noEmit / dependency-cruiser
+cmd = "{py} {gates}/check_file_size.py --workdir {workdir} --hard 500 --warn 300"
+default_owner = "dev_backend"
+
+[[gate]]
+id = "G5"
+name = "secretos y contrato de entorno"
+# En un repo real se anade gitleaks --no-banner detect
+cmd = "{py} {gates}/check_hardcoding.py --workdir {workdir}"
+default_owner = "dev_backend"
+
+[[gate]]
+id = "G6"
+name = "imports locales resueltos"
+# Deterministico y sin toolchain: caza el modulo que se importa y no existe.
+cmd = "{py} {gates}/check_imports.py --workdir {workdir} --roots src,tests"
+default_owner = "dev_backend"
+
+[[gate]]
+id = "G7"
+name = "integridad de pruebas y especificacion"
+cmd = "{py} {gates}/check_test_integrity.py --workdir {workdir} --node {node} --pipeline {root}/pipeline.toml"
+default_owner = "dev_backend"
+
+[[gate]]
+id = "G8"
+name = "cobertura de escenarios"
+route_by = "gate"   # el hallazgo apunta al .feature, pero el responsable es QA
+cmd = "{py} {gates}/check_traceability.py --mode qa --workdir {workdir}"
+default_owner = "qa"
+
+[[gate]]
+id = "G9"
+name = "suite ejecutada en verde"
+# El unico gate que EJECUTA. Sin el, el verde del pipeline no significa nada.
+cmd = "{py} {gates}/check_suite.py --workdir {workdir} --timeout 900"
+default_owner = "qa"
+
+[[gate]]
+id = "G10"
+name = "plan de tareas ejecutable"
+route_by = "gate"
+cmd = "{py} {gates}/check_plan.py --workdir {workdir} --pipeline {root}/pipeline.toml"
+default_owner = "planner"
+
+# --- Revisiones (R*) --------------------------------------------------------
+# CATEGORIA DISTINTA. Los G* son codigo determinista sin juicio. Los R* son un
+# modelo juzgando el trabajo de otro modelo. Cumplen el mismo contrato de salida,
+# pero estan acotados: corren al final, solo si los G* del nodo estan verdes, solo
+# los hallazgos 'blocking' frenan, y tienen tope de rondas. Solo pueden ANADIR
+# defectos; ninguno puede relajar un gate determinista.
+
+[[gate]]
+id = "R1"
+name = "revision critica de especificacion"
+route_by = "node"          # el defecto vuelve al nodo que produjo el artefacto
+skip_if_prior_failed = true  # no se critica lo que ya se sabe roto: cuesta tokens
+cmd = "{py} {gates}/check_review.py --workdir {workdir} --node {node} --max-rounds 2 --prompt {root}/agents/reviewer.md --label R1"
+default_owner = "product"
+
+[[gate]]
+id = "R2"
+name = "revision critica de codigo"
+# Mismo mecanismo que R1 pero sobre los entregables de la tarea activa; el estado
+# se lleva por tarea. En modo real cuesta una llamada al modelo por tarea de codigo.
+route_by = "node"
+skip_if_prior_failed = true
+cmd = "{py} {gates}/check_review.py --workdir {workdir} --node {node} --max-rounds 2 --prompt {root}/agents/reviewer.md --label R2"
+default_owner = "dev_backend"
