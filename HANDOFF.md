@@ -28,9 +28,10 @@ backend, que la cierra y desbloquea a QA.
 
 1. **Lineal** — `product → architect → planner → gate humano`. Produce la
    especificación y `spec/30_plan/tasks.yaml`.
-2. **Sprint durable** — LangGraph despacha tareas listas con `Send`; las huellas
-   no superpuestas corren en worktrees paralelos y se integran en orden. Un
-   defecto de otro nodo se vuelve una tarea `D-###` para su dueño.
+2. **Sprint durable** — LangGraph despacha con `Send` la ola maximal de huellas no
+   superpuestas, limitada por `max_concurrency`. Scrum prioriza defectos y camino
+   crítico cuando faltan cupos; los worktrees se integran en orden determinista.
+   Un defecto de otro nodo se vuelve una tarea `D-###` para su dueño.
 
 ## Verificación: dos categorías
 
@@ -89,12 +90,19 @@ que lo que fallo se reintente en vez de re-escalar) y conserva los commits previ
 Nota: el panel debe reiniciarse (`sdd web`) para exponer el boton si estaba abierto
 de antes.
 
+El runtime usa las APIs asíncronas de LangGraph y guarda deltas compactos en vez de
+reescribir todo el estado en cada nodo. `.agent/metrics.jsonl` y
+`.agent/usage.jsonl` permiten ver latencia, llamadas, tokens y uso de caché con
+`sdd show` o en el reporte HTML. G7 permanece serial como barrera de propiedad; el
+resto de G* corre concurrentemente y las revisiones verdes R1/R2 se cachean por
+contenido.
+
 ## Lo que NO está hecho (ver la auditoría del sistema)
 
 - El modo real **no se ha ejecutado contra un modelo**: todo lo verificado es el
   plano de control, en simulación y con pruebas. La calidad de los agentes reales
   y del criterio de R1 está sin medir.
-- SQLite es el checkpointer local; despliegues multiproceso deben migrarlo a
+- SQLite es el checkpointer asíncrono local; despliegues multiproceso deben migrarlo a
   PostgreSQL.
 - `config.json` guarda las API keys en claro (mitigado con permisos `600` +
   `.gitignore`, no cifrado).

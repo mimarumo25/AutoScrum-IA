@@ -22,6 +22,8 @@ import time
 import urllib.error
 import urllib.request
 
+import metrics
+
 
 class ProviderError(RuntimeError):
     pass
@@ -30,7 +32,9 @@ class ProviderError(RuntimeError):
 # Uso de tokens de la ULTIMA llamada a complete(). El presupuesto contaba solo
 # llamadas; esto permite ademas contar tokens (y, aguas arriba, coste). Se acumula
 # a traves de las continuaciones para no subcontar una respuesta larga.
-_LAST_USAGE = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+_LAST_USAGE = {"input_tokens": 0, "output_tokens": 0, "calls": 0,
+               "cache_read_input_tokens": 0,
+               "cache_creation_input_tokens": 0}
 
 
 def last_usage() -> dict:
@@ -38,13 +42,17 @@ def last_usage() -> dict:
 
 
 def _reset_usage():
-    _LAST_USAGE.update(input_tokens=0, output_tokens=0, calls=0)
+    _LAST_USAGE.update(input_tokens=0, output_tokens=0, calls=0,
+                       cache_read_input_tokens=0,
+                       cache_creation_input_tokens=0)
 
 
-def _add_usage(input_tokens, output_tokens):
+def _add_usage(input_tokens, output_tokens, cache_read=0, cache_creation=0):
     _LAST_USAGE["input_tokens"] += int(input_tokens or 0)
     _LAST_USAGE["output_tokens"] += int(output_tokens or 0)
     _LAST_USAGE["calls"] += 1
+    _LAST_USAGE["cache_read_input_tokens"] += int(cache_read or 0)
+    _LAST_USAGE["cache_creation_input_tokens"] += int(cache_creation or 0)
 
 
 # --- Resiliencia de la llamada ---------------------------------------------
@@ -195,13 +203,35 @@ def describe():
 def complete(system: str, user: str) -> str:
     _reset_usage()
     p = current_provider()
-    if p == "anthropic":
-        return _anthropic(system, user)
-    if p == "openai" or p in OPENAI_PRESETS:
-        return _openai_compatible(p, system, user)
-    raise ProviderError(
-        f"SDD_PROVIDER='{p}' desconocido. Opciones: anthropic, "
-        f"{', '.join(OPENAI_PRESETS)}, openai.")
+    started = time.perf_counter()
+    outcome = "ok"
+    try:
+        if p == "anthropic":
+            return _anthropic(system, user)
+        if p == "openai" or p in OPENAI_PRESETS:
+            return _openai_compatible(p, system, user)
+        raise ProviderError(
+            f"SDD_PROVIDER='{p}' desconocido. Opciones: anthropic, "
+            f"{', '.join(OPENAI_PRESETS)}, openai.")
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        usage = last_usage()
+        metrics.record(
+            os.environ.get("SDD_METRICS_WORKDIR"),
+            os.environ.get("SDD_METRICS_OPERATION", "llm"),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            outcome=outcome, provider=p,
+            node=os.environ.get("SDD_METRICS_NODE", ""),
+            task=os.environ.get("SDD_METRICS_TASK", ""),
+            input_chars=len(system) + len(user), **usage)
+        if usage["calls"]:
+            metrics.record_usage(
+                os.environ.get("SDD_METRICS_WORKDIR"),
+                operation=os.environ.get("SDD_METRICS_OPERATION", "llm"),
+                provider=p, node=os.environ.get("SDD_METRICS_NODE", ""),
+                task=os.environ.get("SDD_METRICS_TASK", ""), **usage)
 
 
 def _anthropic(system: str, user: str) -> str:
@@ -221,13 +251,19 @@ def _anthropic(system: str, user: str) -> str:
 
         def once():
             # Streaming: max_tokens alto sin riesgo de timeout HTTP.
-            with client.messages.stream(model=model, max_tokens=MAX_TOKENS,
-                                        system=system, messages=messages) as stream:
+            kwargs = {"model": model, "max_tokens": MAX_TOKENS,
+                      "system": system, "messages": messages}
+            if os.environ.get("SDD_PROMPT_CACHE", "1") != "0":
+                kwargs["cache_control"] = {"type": "ephemeral"}
+            with client.messages.stream(**kwargs) as stream:
                 return stream.get_final_message()
 
         msg = _with_retry(once, "anthropic.messages.stream")
         u = getattr(msg, "usage", None)
-        _add_usage(getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0))
+        _add_usage(
+            getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0),
+            getattr(u, "cache_read_input_tokens", 0),
+            getattr(u, "cache_creation_input_tokens", 0))
         text = "".join(b.text for b in msg.content if b.type == "text")
         return text, msg.stop_reason == "max_tokens"
 

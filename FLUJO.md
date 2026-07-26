@@ -27,7 +27,7 @@ flowchart TD
     subgraph BUCLE ["Sprint LangGraph · worktrees por tarea"]
         direction TB
         SEL{"¿qué tareas tienen<br/>dependencias cerradas?"}
-        SEND["<b>Send workers</b><br/>solo huellas no superpuestas"]
+        SEND["<b>Send workers</b><br/>ola maximal · prioridad Scrum<br/>huellas no superpuestas"]
         EXE["worktree aislado por tarea<br/><b>dev_backend</b> · <b>dev_frontend</b> · <b>qa</b>"]
         COL["colector<br/>gates verdes + integración Git"]
         SEL -->|sí| SEND --> EXE --> COL --> SEL
@@ -292,7 +292,9 @@ flowchart TD
 ```
 
 `checkpoints.sqlite` permite reanudar desde el último superstep y conserva los
-resultados de ramas hermanas ya completadas. `state.json` no gobierna el grafo:
+resultados de ramas hermanas ya completadas. Los nodos escriben deltas compactos y
+el colector descarta `parallel_results` después de integrarlos, evitando que el
+checkpoint crezca con resultados ya consumidos. `state.json` no gobierna el grafo:
 es una proyección compatible con el visor, el reporte y corridas antiguas.
 
 ---
@@ -324,7 +326,7 @@ problema de verdad.
 
 ## Límites de este flujo
 
-- **Checkpoint local.** SQLite sirve para la aplicación síncrona actual; un
+- **Checkpoint local.** SQLite sirve para la aplicación asíncrona actual de un proceso; un
   despliegue multiproceso debe usar PostgreSQL.
 - **Efectos externos.** El journal evita repetir visitas completadas, pero la
   ventana entre respuesta y journal requiere idempotency keys del proveedor para
@@ -332,11 +334,13 @@ problema de verdad.
 - **R2 revisa el código por tarea** (`dev_backend`, `dev_frontend`, `qa`), con el
   mismo mecanismo que R1 y estado por tarea. Su criterio real no está medido: en
   `--simulate` no bloquea, y el modo real no se ha ejecutado.
-- **R1/R2 cuestan una llamada al modelo por nodo/tarea y ronda.** El
-  `skip_if_prior_failed` evita las inútiles, pero el coste no es cero: en un plan
-  grande, R2 añade una llamada por tarea de código.
+- **R1/R2 pueden costar una llamada al modelo por nodo/tarea y ronda.** El
+  `skip_if_prior_failed` evita las inútiles y un resultado verde se reutiliza si
+  no cambian tarea, prompt ni artefactos; un cambio real invalida la caché.
 - **Sin aprendizaje entre corridas.** Un defecto que se repite siempre debería
   acabar en el prompt del nodo, y hoy no lo hace.
-- **El presupuesto cuenta llamadas, no tokens ni USD.**
+- **El coste no se calcula en USD.** Se registran todas las llamadas, tokens de
+  entrada/salida y tokens de caché; el límite de llamadas sigue gobernando a los
+  agentes principales.
 - **El modo real no se ha ejecutado contra un modelo.** Todo lo de arriba está
   verificado en simulación y con la suite automatizada.

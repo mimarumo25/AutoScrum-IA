@@ -43,6 +43,9 @@ REGLAS DURAS
 5. depends_on refleja dependencia REAL de artefacto: si T-B importa lo que produce
    T-A, T-B depende de T-A. Sin ciclos. Sin dependencias decorativas: una
    dependencia falsa serializa el plan y alarga la corrida sin motivo.
+   En particular, un frontend que implementa el contrato OpenAPI NO depende del
+   handler backend si no importa ninguno de sus archivos: ambos deben quedar
+   listos en paralelo contra el contrato firmado.
 6. QA es UNA sola tarea (nodo qa), que depende de todas las tareas de codigo y
    logra la cobertura total de los escenarios @critical y la suite en verde. No
    partas QA en "unitarias" e "integracion" por separado: los gates G8 (cobertura)

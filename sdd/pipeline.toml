@@ -14,7 +14,8 @@ simulate_cmd = "{py} {root}/examples/fake_agent.py {node} {workdir}"
 # Tareas listas se ejecutan en worktrees aislados. LangGraph solo agrupa en el
 # mismo superstep las que no comparten entregables; este techo evita saturar el
 # proveedor y se puede bajar a 1 sin cambiar la semantica.
-max_concurrency = 3
+max_concurrency = 6
+gate_concurrency = 4
 
 [budget]
 max_retries_per_gate = 2      # tras esto, ESCALATE_HUMAN

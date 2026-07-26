@@ -179,7 +179,9 @@ def _token_usage(wd):
     """Suma .agent/usage.jsonl. Vacio en modo simulado."""
     import json as _json
     from pathlib import Path as _Path
-    total = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+    total = {"input_tokens": 0, "output_tokens": 0, "calls": 0,
+             "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 0}
     path = _Path(wd) / ".agent/usage.jsonl"
     if not path.exists():
         return total
@@ -191,6 +193,23 @@ def _token_usage(wd):
         for k in total:
             total[k] += int(rec.get(k, 0) or 0)
     return total
+
+
+def _performance_section(wd):
+    """Resumen compacto de la telemetria local de la corrida."""
+    import metrics as _metrics
+    summary = _metrics.summarize(wd)
+    if not summary:
+        return []
+    lines = ["", "## Rendimiento del plano de control", ""]
+    for operation, values in sorted(
+            summary.items(), key=lambda item: -float(item[1]["duration_ms"])):
+        count = int(values["count"])
+        total = float(values["duration_ms"])
+        lines.append(
+            f"- `{operation}` — {count} operacion(es), {total:.0f} ms total, "
+            f"{(total / count if count else 0):.1f} ms promedio")
+    return lines
 
 
 def write_run_report(state, workdir, task, git):
@@ -214,7 +233,8 @@ def write_run_report(state, workdir, task, git):
                   if e["event"] == "APROBADO" and e.get("accion") == "sin-commit"]
     usage = _token_usage(wd)
     tok = (f"{usage['input_tokens']} entrada + {usage['output_tokens']} salida "
-           f"({usage['calls']} llamada(s) al modelo)"
+           f"({usage['calls']} llamada(s) al modelo; "
+           f"{usage['cache_read_input_tokens']} entrada desde cache)"
            if usage["calls"] else "n/d (modo simulado, 0 tokens)")
 
     lines = [
@@ -251,6 +271,7 @@ def write_run_report(state, workdir, task, git):
         lines += ["", "## Reintentos por gate"]
         for k, v in sorted(state["attempts"].items()):
             lines.append(f"- {k}: {v}")
+    lines += _performance_section(wd)
     lines += ["", "## Historial de commits"]
     lines += [f"- {l}" for l in logline] or ["- (sin commits)"]
 

@@ -1,4 +1,4 @@
-# Pipeline SDD multi-agente — LangGraph v0.2
+# Pipeline SDD multi-agente — LangGraph v0.3
 
 Plano de control primero: los gates y la propiedad de paths son lo que hace utilizable
 un pipeline de agentes. El orquestador es la pieza barata.
@@ -8,11 +8,14 @@ un pipeline de agentes. El orquestador es la pieza barata.
 | Archivo | Rol |
 |---|---|
 | `pipeline.toml` | grafo, propiedad de paths, entregables exigidos, presupuesto |
-| `graph_runtime.py` | StateGraph, checkpoints SQLite e interrupt humano |
+| `graph_runtime.py` | StateGraph asíncrono, checkpoints SQLite e interrupt humano |
 | `orchestrator.py` | supervisor y reglas de dominio (router puro, sin juicio) |
 | `taskqueue.py` | la cola del sprint: dependencias, bloqueos y tareas de defecto |
 | `parallel_tasks.py` | scheduler, Send workers y colector de resultados |
+| `scrum.py` / `plan_analysis.py` | prioridad de la ola y análisis de camino crítico |
 | `task_worktrees.py` | aislamiento e integracion Git por tarea |
+| `optimized_gates.py` | ejecución concurrente y caché segura de revisiones R1/R2 |
+| `metrics.py` | tiempos, llamadas y uso de tokens en JSONL |
 | `gates/registry.toml` | registro declarativo de gates y su enrutamiento |
 | `gates/check_*.py` | checkers deterministas (`G*`) + la revision critica (`R1`) |
 | `agents/*.md` | los seis system prompts + el del revisor |
@@ -25,8 +28,11 @@ especificacion y, sobre todo, `spec/30_plan/tasks.yaml`: el corte del sistema en
 tareas con dueno, entregables, dependencias y criterio de aceptacion.
 
 **Sprint de tareas** — LangGraph despacha las tareas con dependencias cerradas.
-Las que no comparten entregables corren en paralelo, cada una dentro de su propio
-Git worktree; el colector integra sus deltas en orden determinista. Cada tarea es
+Las que no comparten entregables corren en una ola maximal, hasta
+`runtime.max_concurrency`, cada una dentro de su propio Git worktree. Cuando hay
+más candidatas que cupos, el supervisor Scrum prioriza defectos, camino crítico y
+tareas que desbloquean más trabajo; el colector integra sus deltas en orden
+determinista. Cada tarea es
 una llamada acotada a un agente, sus gates y su propio commit. Un
 defecto que pertenece a otro nodo no es un reintento a ciegas: se convierte en una
 tarea `D-###` para su dueno, y la tarea que lo destapo queda bloqueada hasta que
@@ -93,9 +99,13 @@ tarea de defecto para el backend, que la cierra y desbloquea a QA. No consume to
       __main__.py            punto de entrada único (sdd / python -m sdd)
       cli.py                 dispatcher de subcomandos (CLI)
       server.py              panel web (stdlib http.server)
-      graph_runtime.py       StateGraph + SQLite + interrupt humano
+      graph_runtime.py       StateGraph async + SQLite + interrupt humano
       parallel_tasks.py      scheduler + Send workers + colector
+      scrum.py               prioridad determinista de tareas listas
+      plan_analysis.py       camino crítico, ancho y avisos del DAG
       task_worktrees.py      worktree, integración y limpieza por tarea
+      optimized_gates.py     gates G* concurrentes + caché R1/R2
+      metrics.py             telemetría local append-only
       execution_journal.py   idempotencia de visitas externas completadas
       orchestrator.py        supervisor y reglas deterministas de ruta
       taskqueue.py           cola de tareas: dependencias, bloqueos, defectos
@@ -143,6 +153,12 @@ reales. Cada nodo escribe artefactos reales; los gates los verifican; el supervi
 enruta y reintenta; se detiene en el gate humano (nodo `human_gate`). Consúmelo después con
 `sdd show --workdir project/mi-app` o `sdd view --workdir project/mi-app`.
 
+Con Anthropic, el prompt estable usa caché efímera por defecto; se puede desactivar
+con `SDD_PROMPT_CACHE=0`. `SDD_REVIEW_MODEL` permite reservar un modelo más rápido
+para R1/R2 y para el desempate Scrum. Toda llamada —incluidas revisiones— registra
+latencia, tokens normales y tokens de caché en `.agent/usage.jsonl`; los tiempos de
+nodos, gates y checkpoints quedan en `.agent/metrics.jsonl`.
+
 ## Contrato de un checker
 
 Imprime en stdout `{"findings":[{"file","line","rule","evidence"}]}` y sale con codigo
@@ -173,7 +189,11 @@ es donde enchufas eslint/ruff, tsc/mypy, gitleaks/semgrep y `--cov-fail-under`.
 
 ## Invocacion real del agente
 
-`pipeline.toml` seccion `[runtime]`, claves `agent_cmd` y `max_concurrency`.
+`pipeline.toml` seccion `[runtime]`, claves `agent_cmd`, `max_concurrency` y
+`gate_concurrency`. El runtime usa `ainvoke`, `AsyncSqliteSaver` y durabilidad
+asíncrona; los gates deterministas se ejecutan en paralelo después de G7. R1/R2
+solo corren cuando todos los G* están verdes y los resultados verdes se reutilizan
+mientras el hash de tarea, prompt y artefactos no cambie.
 Verifica los flags contra
 https://docs.claude.com/en/docs/claude-code/overview antes de usarlo: cambian entre
 versiones. El aislamiento por path se consigue con `git worktree` por tarea mas los
@@ -183,15 +203,16 @@ configurarse mal, la verificadora no depende del agente.
 
 ## Limites conocidos
 
-- **SQLite es local.** `.agent/checkpoints.sqlite` es adecuado para esta aplicacion
-  local y sincronica. Un servicio con varios procesos debe usar un checkpointer
+- **SQLite es local.** `.agent/checkpoints.sqlite` es adecuado para esta aplicación
+  local asíncrona de un proceso. Un servicio con varios procesos debe usar un checkpointer
   PostgreSQL; `state.json` es solo la proyeccion legible para CLI y panel.
 - **La ventana exactamente-una-vez depende del proveedor.** El journal evita
   repetir una visita completada si el proceso cae antes del checkpoint, pero un
   corte entre la respuesta del modelo y el journal solo se cierra con una
   idempotency key soportada por la API externa.
-- **El presupuesto cuenta llamadas, no tokens ni USD.** Instrumentar antes de
-  dejarlo solo.
+- **El coste está instrumentado, no expresado en USD.** El límite de llamadas
+  gobierna los agentes principales y el de tokens incluye también revisiones; el
+  precio depende del proveedor y debe calcularse externamente.
 - **Sin retroalimentacion entre corridas**: un defecto que se repite en todos los
   proyectos deberia acabar en el prompt del nodo, y hoy no lo hace.
 - **El modo real aun necesita medicion.** El runtime, los gates, la recuperacion y

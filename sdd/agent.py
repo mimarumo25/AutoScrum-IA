@@ -233,21 +233,6 @@ def gather_defects(workdir: Path, node: str) -> str:
             "deterministas):\n" + "\n".join(lines))
 
 
-def _persist_usage(workdir: Path, node: str, usage: dict):
-    task = ""
-    tp = workdir / ".agent/current_task.json"
-    if tp.exists():
-        try:
-            task = json.loads(tp.read_text(encoding="utf-8")).get("id", "")
-        except ValueError:
-            pass
-    line = json.dumps({"node": node, "task": task, **usage}, ensure_ascii=False)
-    path = workdir / ".agent/usage.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
-
-
 def main():
     if len(sys.argv) != 3:
         print("uso: agent.py <node> <workdir>", file=sys.stderr)
@@ -296,11 +281,6 @@ def main():
         print(f"  [agent] fallo la llamada al modelo: {type(e).__name__}: {e}",
               file=sys.stderr)
         return 1
-
-    # Contabilidad de tokens: el presupuesto contaba solo llamadas. Cada nodo deja
-    # su consumo en .agent/usage.jsonl; el orquestador lo suma y el reporte lo
-    # muestra. En modo simulado no hay tokens y este archivo no existe.
-    _persist_usage(workdir, node, providers.last_usage())
 
     blocked = BLOCKED_BLOCK.search(text)
     if blocked and not FILE_BLOCK.search(text):

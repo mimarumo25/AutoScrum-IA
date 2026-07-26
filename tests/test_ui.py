@@ -81,6 +81,15 @@ class TestReport(unittest.TestCase):
             u = report._token_usage(wd)
             self.assertEqual((u["input_tokens"], u["output_tokens"], u["calls"]), (15, 5, 2))
 
+    def test_performance_section_resume_metricas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import metrics
+            metrics.record(tmp, "gate_process", duration_ms=20)
+            metrics.record(tmp, "gate_process", duration_ms=10)
+            text = "\n".join(report._performance_section(tmp))
+            self.assertIn("gate_process", text)
+            self.assertIn("30 ms total", text)
+
 
 class TestServer(unittest.TestCase):
     def test_page_incluye_pestanas_y_sprint(self):

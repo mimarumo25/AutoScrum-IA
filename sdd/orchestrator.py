@@ -35,9 +35,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "gates"))
 import taskqueue  # noqa: E402
 import graph_runtime  # noqa: E402
+import metrics  # noqa: E402
+import plan_analysis  # noqa: E402
 from execution_journal import invoke_once  # noqa: E402
 from report import write_run_report  # noqa: E402
-from run_gates import run_node_gates  # noqa: E402
+from optimized_gates import run_node_gates  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 LOOP = "task_loop"
@@ -104,11 +106,15 @@ def load_state(workdir, start):
 
 
 def save(state, path):
+    started = time.perf_counter()
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_suffix(".json.tmp")
     pending.write_text(
         json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
     pending.replace(path)
+    metrics.record(path.parent.parent, "state_projection",
+                   duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                   bytes=path.stat().st_size)
 
 
 def git(workdir, *args):
@@ -118,7 +124,9 @@ def git(workdir, *args):
 def token_usage(workdir):
     """Suma .agent/usage.jsonl. Vacio en modo simulado (no hay tokens)."""
     path = Path(workdir) / ".agent/usage.jsonl"
-    total = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+    total = {"input_tokens": 0, "output_tokens": 0, "calls": 0,
+             "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 0}
     if not path.exists():
         return total
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -189,7 +197,19 @@ def invoke_agent(node, workdir, cfg, simulate, task):
     cmd = template.format(py=shlex.quote(sys.executable), root=ROOT.as_posix(),
                           node=node["id"], workdir=Path(workdir).as_posix(),
                           prompt=(ROOT / node["prompt"]).as_posix(), task=task)
-    proc = subprocess.run(shlex.split(cmd), cwd=workdir, capture_output=True, text=True)
+    task_id = str(task.get("id", "")) if isinstance(task, dict) else ""
+    env = os.environ.copy()
+    env.update(SDD_METRICS_WORKDIR=str(workdir),
+               SDD_METRICS_OPERATION="agent_llm",
+               SDD_METRICS_NODE=str(node["id"]),
+               SDD_METRICS_TASK=task_id)
+    started = time.perf_counter()
+    proc = subprocess.run(shlex.split(cmd), cwd=workdir, capture_output=True,
+                          text=True, env=env)
+    metrics.record(workdir, "agent_process",
+                   duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                   node=node["id"], task=task_id,
+                   simulate=bool(simulate), returncode=proc.returncode)
     err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")
     return proc.returncode, err[-220:]
 
@@ -372,6 +392,8 @@ def step(state, args, cfg, nodes, auto_human):
 
     owner, gate_id, findings = route(reports, cfg)
     if owner is None:
+        if node["id"] == "planner":
+            plan_analysis.log_plan(args.workdir, state, log)
         approve(state, args.workdir, node, task, log)
     else:
         handle_defect(state, args.workdir, node, task, owner, gate_id,

@@ -5,30 +5,35 @@ checkpoints SQLite, reanudacion, interrupt humano y un limite claro alrededor de
 los efectos de cada visita. state.json se conserva como proyeccion legible para
 el panel, los reportes y la compatibilidad con corridas anteriores.
 """
+import asyncio
 import copy
 import hashlib
-import json
 import os
-import sqlite3
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Callable, TypedDict
 
 os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 
-from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: E402
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: E402
 from langgraph.graph import END, START, StateGraph  # noqa: E402
 from langgraph.types import Command, interrupt  # noqa: E402
 
 from parallel_tasks import ParallelTasks  # noqa: E402
+from human_approval import (approval_record, rejected_record, spec_hash,
+                            waiting_projection)  # noqa: E402
 
 
 CHECKPOINT_PATH = ".agent/checkpoints.sqlite"
+_RESET_RESULTS = "__sdd_reset__"
 
 
-def _merge_results(left: dict[str, dict[str, object]],
-                   right: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
+def _merge_results(left: dict[str, object],
+                   right: dict[str, object]) -> dict[str, object]:
+    """Acumula ramas del superstep y permite liberar el lote ya colectado."""
+    if right.get(_RESET_RESULTS) is True:
+        return {key: value for key, value in right.items()
+                if key != _RESET_RESULTS}
     return {**left, **right}
 
 
@@ -50,7 +55,7 @@ class PipelineState(TypedDict, total=False):
     checkpoint_db: str
     batch_seq: int
     parallel_batch: dict[str, object] | None
-    parallel_results: Annotated[dict[str, dict[str, object]], _merge_results]
+    parallel_results: Annotated[dict[str, object], _merge_results]
     worker_task_id: str | None
 
 
@@ -60,6 +65,19 @@ LogFn = Callable[..., None]
 
 def _copy_state(state: dict[str, object]) -> PipelineState:
     return copy.deepcopy(dict(state))
+
+
+def _delta(before: PipelineState, after: PipelineState) -> dict[str, object]:
+    """Devuelve solo canales modificados para no reserializar todo el estado."""
+    changed: dict[str, object] = {}
+    for key, value in after.items():
+        if before.get(key) == value:
+            continue
+        if key == "parallel_results" and not value and before.get(key):
+            changed[key] = {_RESET_RESULTS: True}
+        else:
+            changed[key] = value
+    return changed
 
 
 def _normalize(state: PipelineState) -> PipelineState:
@@ -88,43 +106,8 @@ def _visit_id(state: PipelineState) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
-def _spec_hash(workdir: str) -> str:
-    root = Path(workdir) / "spec"
-    digest = hashlib.sha256()
-    if not root.exists():
-        return digest.hexdigest()
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def approval_record(workdir: str, actor: str,
-                    mode: str = "interactive") -> dict[str, object]:
-    """Firma reproducible del conjunto de especificaciones aprobado."""
-    return {
-        "approved": True,
-        "actor": actor,
-        "mode": mode,
-        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "spec_hash": _spec_hash(workdir),
-    }
-
-
 def _has_interrupt(snapshot: object) -> bool:
     return bool(getattr(snapshot, "interrupts", ()))
-
-
-def waiting_state(path: Path, fallback: PipelineState) -> PipelineState:
-    """Lee la proyeccion waiting_human escrita justo antes de interrupt()."""
-    if not path.exists():
-        return fallback
-    try:
-        return _normalize(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, ValueError, TypeError):
-        return fallback
 
 
 def run_pipeline(state: dict[str, object], state_path: Path, args: object,
@@ -143,11 +126,11 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
     def project(value: PipelineState) -> None:
         save_fn(dict(value), state_path)
 
-    def bootstrap(value: PipelineState) -> PipelineState:
+    def bootstrap(value: PipelineState) -> dict[str, object]:
         current = _normalize(_copy_state(value))
         if current.get("status") != "running":
             project(current)
-            return current
+            return _delta(value, current)
         budget = cfg["budget"]
         deadline = float(current.get("started_at", time.time())) + \
             int(budget["max_wall_minutes"]) * 60
@@ -161,7 +144,7 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
             log_fn(current, "PRESUPUESTO",
                    motivo=f"max_output_tokens agotado ({spent} > {max_out})")
         project(current)
-        return current
+        return _delta(value, current)
 
     agent_ids = {
         node_id for node_id, node in nodes.items()
@@ -182,7 +165,7 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
     def choose_agent(value: PipelineState) -> str:
         return str(value.get("cursor", "product"))
 
-    def agent_node(value: PipelineState) -> PipelineState:
+    def agent_node(value: PipelineState) -> dict[str, object]:
         current = _normalize(_copy_state(value))
         setattr(args, "visit_id", current.get("active_visit"))
         try:
@@ -193,27 +176,27 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
         if "resume_at" not in current:
             current["resume_at"] = None
         project(current)
-        return current
+        return _delta(value, current)
 
     parallel = ParallelTasks(
         workdir, args, cfg, nodes, auto_human, step_fn,
         log_fn, commit_fn, _normalize, project)
 
-    def human_node(value: PipelineState) -> PipelineState:
+    def human_node(value: PipelineState) -> dict[str, object]:
         current = _normalize(_copy_state(value))
         signed = current.get("human_approval")
         if isinstance(signed, dict) and signed.get("approved"):
             current["status"] = "running"
             current["cursor"] = str(nodes["human_gate"]["next"])
             project(current)
-            return current
+            return _delta(value, current)
 
         if auto_human:
             step_fn(current, args, cfg, nodes, auto_human)
             current["human_approval"] = approval_record(
                 workdir, "autonomous", mode="automatic")
             project(current)
-            return current
+            return _delta(value, current)
 
         waiting = _copy_state(current)
         waiting["status"] = "waiting_human"
@@ -223,7 +206,7 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
         decision = interrupt({
             "kind": "human_approval",
             "run_id": current.get("run_id"),
-            "spec_hash": _spec_hash(workdir),
+            "spec_hash": spec_hash(workdir),
             "message": "Aprobar la especificacion y el plan antes de escribir codigo",
         })
         approved = decision is True or (
@@ -233,11 +216,7 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
         current = waiting
         if not approved:
             current["status"] = "escalated"
-            current["human_approval"] = {
-                "approved": False,
-                "actor": actor,
-                "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            }
+            current["human_approval"] = rejected_record(actor)
             log_fn(current, "ESCALATE_HUMAN", motivo="plan rechazado por el humano")
         else:
             current["status"] = "running"
@@ -246,7 +225,13 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
             log_fn(current, "APROBADO", nodo="human_gate", accion="firma",
                    detalle=current["human_approval"]["spec_hash"])
         project(current)
-        return current
+        return _delta(value, current)
+
+    def schedule_node(value: PipelineState) -> dict[str, object]:
+        return _delta(value, parallel.schedule(value))
+
+    def collect_node(value: PipelineState) -> dict[str, object]:
+        return _delta(value, parallel.collect(value))
 
     builder = StateGraph(PipelineState)
     builder.add_node("bootstrap", bootstrap)
@@ -255,10 +240,10 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
         builder.add_node(node_id, agent_node)
         builder.add_edge(node_id, "bootstrap")
     builder.add_node("human_gate", human_node)
-    builder.add_node("task_loop", parallel.schedule)
+    builder.add_node("task_loop", schedule_node)
     builder.add_node("parallel_dispatch", lambda value: {})
     builder.add_node("parallel_worker", parallel.worker)
-    builder.add_node("parallel_collect", parallel.collect)
+    builder.add_node("parallel_collect", collect_node)
     builder.add_edge(START, "bootstrap")
     builder.add_conditional_edges("bootstrap", choose_next)
     builder.add_conditional_edges("prepare", choose_agent)
@@ -268,30 +253,31 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
     builder.add_edge("parallel_worker", "parallel_collect")
     builder.add_edge("parallel_collect", "bootstrap")
 
-    connection = sqlite3.connect(checkpoint_path, check_same_thread=False)
-    try:
-        checkpointer = SqliteSaver(connection)
-        graph = builder.compile(checkpointer=checkpointer)
-        config = {
-            "configurable": {"thread_id": str(initial["run_id"])},
-            "recursion_limit": max(
-                250, int(cfg["budget"]["max_agent_calls"]) * 8),
-        }
-        before = graph.get_state(config)
-        if resume_requested and _has_interrupt(before):
-            actor = "autonomous" if auto_human else os.environ.get(
-                "SDD_APPROVAL_ACTOR", "cli")
-            graph_input = Command(resume={"approved": True, "actor": actor})
-        elif resume_requested and getattr(before, "next", ()):
-            graph_input = None
-        else:
-            graph_input = initial
-        graph.invoke(graph_input, config=config)
-        after = graph.get_state(config)
-        if _has_interrupt(after):
-            return dict(waiting_state(state_path, initial))
-        final = _normalize(_copy_state(after.values))
-        project(final)
-        return dict(final)
-    finally:
-        connection.close()
+    async def execute_graph() -> dict[str, object]:
+        async with AsyncSqliteSaver.from_conn_string(str(checkpoint_path)) as checkpointer:
+            graph = builder.compile(checkpointer=checkpointer)
+            config = {
+                "configurable": {"thread_id": str(initial["run_id"])},
+                "recursion_limit": max(
+                    250, int(cfg["budget"]["max_agent_calls"]) * 8),
+                "max_concurrency": max(
+                    1, int(cfg["runtime"].get("max_concurrency", 3))),
+            }
+            before = await graph.aget_state(config)
+            if resume_requested and _has_interrupt(before):
+                actor = "autonomous" if auto_human else os.environ.get(
+                    "SDD_APPROVAL_ACTOR", "cli")
+                graph_input = Command(resume={"approved": True, "actor": actor})
+            elif resume_requested and getattr(before, "next", ()):
+                graph_input = None
+            else:
+                graph_input = initial
+            await graph.ainvoke(graph_input, config=config, durability="async")
+            after = await graph.aget_state(config)
+            if _has_interrupt(after):
+                return dict(_normalize(waiting_projection(state_path, initial)))
+            final = _normalize(_copy_state(after.values))
+            project(final)
+            return dict(final)
+
+    return asyncio.run(execute_graph())

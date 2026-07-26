@@ -48,11 +48,10 @@ def _overlaps(left: list[str], right: list[str]) -> bool:
 
 def safe_batch(ready: list[dict[str, object]],
                nodes: dict[str, dict[str, object]], limit: int) -> list[dict[str, object]]:
-    """Elige tareas sin interseccion de entregables; los defectos van solos."""
-    if not ready:
-        return []
-    if ready[0].get("kind") == "defect":
-        return [ready[0]]
+    """Conjunto independiente maximal, estable segun el orden de prioridad.
+
+    Los defectos no se aislan por tipo: solo una huella compartida serializa.
+    """
     selected: list[dict[str, object]] = []
     footprints: list[list[str]] = []
     for task in ready:
@@ -62,7 +61,7 @@ def safe_batch(ready: list[dict[str, object]],
             footprints.append(current)
         if len(selected) >= max(1, limit):
             break
-    return selected or [ready[0]]
+    return selected or ready[:1]
 
 
 def prepare(workdir: str, run_id: str, task: dict[str, object]) -> dict[str, object]:

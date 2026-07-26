@@ -1,10 +1,37 @@
 """Nodos LangGraph del sprint aislado y paralelo."""
 import copy
+import os
 
 from langgraph.types import Send
 
+import scrum
+import metrics
+import plan_analysis
 import task_worktrees
 import taskqueue
+
+
+def _scrum_complete(system: str, user: str, workdir: str) -> str:
+    """Usa opcionalmente un modelo rapido sin contaminar llamadas posteriores."""
+    import providers
+    keys = ("SDD_MODEL", "SDD_METRICS_OPERATION", "SDD_METRICS_NODE",
+            "SDD_METRICS_TASK", "SDD_METRICS_WORKDIR")
+    previous = {key: os.environ.get(key) for key in keys}
+    review_model = os.environ.get("SDD_REVIEW_MODEL")
+    try:
+        if review_model:
+            os.environ["SDD_MODEL"] = review_model
+        os.environ["SDD_METRICS_OPERATION"] = "scrum_llm"
+        os.environ["SDD_METRICS_NODE"] = "scrum"
+        os.environ["SDD_METRICS_TASK"] = ""
+        os.environ["SDD_METRICS_WORKDIR"] = workdir
+        return providers.complete(system, user)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 class ParallelTasks:
@@ -52,8 +79,16 @@ class ParallelTasks:
             self.project(current)
             return current
 
-        limit = int(self.cfg["runtime"].get("max_concurrency", 3))
-        batch = task_worktrees.safe_batch(ready, self.nodes, limit)
+        slots = max(1, int(self.cfg["runtime"].get("max_concurrency", 3)))
+        simulated = bool(os.environ.get("SDD_SIMULATE"))
+        ready = scrum.prioritize(
+            ready, critical_frs=scrum.read_critical_frs(self.workdir),
+            slots=slots, simulate=simulated,
+            unlocks=plan_analysis.descendants(current["tasks"]),
+            complete_fn=None if simulated else lambda system, user: _scrum_complete(
+                system, user, str(self.workdir)),
+            log_fn=lambda event, **fields: self.log_fn(current, event, **fields))
+        batch = task_worktrees.safe_batch(ready, self.nodes, slots)
         current["batch_seq"] = int(current.get("batch_seq", 0)) + 1
         batch_id = f"B-{current['batch_seq']:04d}"
         try:
@@ -124,6 +159,7 @@ class ParallelTasks:
         node = self.nodes[str(active["node"])]
         task_worktrees.preserve(
             active, [str(path) for path in node.get("writes", [])])
+        metrics.transfer(str(workspace["path"]), self.workdir)
         defect = next((item for item in local["tasks"]
                        if item.get("kind") == "defect"), None)
         if active.get("status") == "done":
@@ -153,6 +189,7 @@ class ParallelTasks:
             if not self._collect_one(current, result):
                 break
         current.update(parallel_batch=None, worker_task_id=None, current_task=None)
+        current["parallel_results"] = {}
         if current["status"] == "running":
             current["cursor"] = "task_loop"
         self.project(current)

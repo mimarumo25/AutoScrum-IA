@@ -19,7 +19,8 @@ Guion (modo normal):
 
 Con SDD_FAKE_STUCK el agente NUNCA corrige: ejercita el techo de reintentos y la
 escalacion a humano (ESCALATE_HUMAN).
-Con SDD_FAKE_PARALLEL T-002 y T-003 quedan listas juntas para probar Send workers.
+Con SDD_FAKE_PARALLEL T-002, T-003 y T-005 quedan listas juntas para probar una
+ola ancha de Send workers.
 """
 import json
 import os
@@ -123,6 +124,19 @@ test: {PYCMD} -m unittest discover -s tests -v
 
 elif node == "planner":
     frontend_dep = "[T-001]" if PARALLEL else "[T-002]"
+    extra_task = """
+  - id: T-005
+    title: registro de auditoria de matriculas
+    node: dev_backend
+    scope: infra
+    fr_refs: [FR-002]
+    deliverables: [src/infra/auditoria.py]
+    context: [src/domain/matricula.py]
+    depends_on: [T-001]
+    acceptance: registrar() devuelve un evento inmutable con estudiante y sede
+""" if PARALLEL else ""
+    qa_dependencies = "[T-001, T-002, T-003, T-005]" if PARALLEL else \
+        "[T-001, T-002, T-003]"
     w("spec/30_plan/tasks.yaml", f"""
 tasks:
   - id: T-001
@@ -155,6 +169,8 @@ tasks:
     depends_on: {frontend_dep}
     acceptance: la vista expone los estados loading, empty, error y success
 
+{extra_task}
+
   - id: T-004
     title: suite de dominio y contrato
     node: qa
@@ -162,7 +178,7 @@ tasks:
     fr_refs: [FR-001, FR-002]
     deliverables: [tests/test_matricula.py, spec/40_qa/traceability.md]
     context: [src/domain/matricula.py, src/api/matriculas.py]
-    depends_on: [T-001, T-002, T-003]
+    depends_on: {qa_dependencies}
     acceptance: SCN-001 y SCN-002 cubiertos y la suite completa en verde
 """)
 
@@ -240,6 +256,11 @@ def crear(payload: dict, cupos: dict) -> dict:
     return resultado
 """)
         w(".env.example", "PAYMENT_API_URL=https://sandbox.example.test\n")
+    elif TID == "T-005":
+        w("src/infra/auditoria.py", """
+def registrar(estudiante_id: str, sede: str) -> dict:
+    return {"estudiante_id": estudiante_id, "sede": sede, "tipo": "matricula"}
+""")
 
 elif node == "dev_frontend":
     w("src/web/renovacion.js", """

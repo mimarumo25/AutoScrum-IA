@@ -14,7 +14,9 @@ ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
 from execution_journal import invoke_once  # noqa: E402
+from graph_runtime import _delta, _merge_results  # noqa: E402
 import cli  # noqa: E402
+import metrics  # noqa: E402
 import task_worktrees  # noqa: E402
 
 PY = sys.executable
@@ -50,6 +52,39 @@ class TestExecutionJournal(unittest.TestCase):
             self.assertEqual(calls, ["call"], "la llamada externa no debe duplicarse")
 
 
+class TestCompactState(unittest.TestCase):
+    def test_delta_solo_devuelve_canales_modificados(self):
+        before = {"status": "running", "history": [{"event": "A"}],
+                  "tasks": [], "parallel_results": {}}
+        after = deepcopy(before)
+        after["status"] = "done"
+        self.assertEqual(_delta(before, after), {"status": "done"})
+
+    def test_resultados_paralelos_se_pueden_liberar(self):
+        merged = _merge_results({"B:T-1": {"ok": True}},
+                                {"__sdd_reset__": True})
+        self.assertEqual(merged, {})
+
+    def test_metricas_se_resumen_por_operacion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics.record(tmp, "gate", duration_ms=2.5)
+            metrics.record(tmp, "gate", duration_ms=3.5)
+            self.assertEqual(metrics.summarize(tmp)["gate"],
+                             {"count": 2, "duration_ms": 6.0})
+
+    def test_transfiere_telemetria_de_un_worker(self):
+        with tempfile.TemporaryDirectory() as source, \
+                tempfile.TemporaryDirectory() as destination:
+            metrics.record(source, "agent_process", duration_ms=8)
+            metrics.record_usage(source, input_tokens=11, output_tokens=3)
+            metrics.transfer(source, destination)
+            self.assertEqual(
+                metrics.summarize(destination)["agent_process"]["count"], 1)
+            usage = (Path(destination) / metrics.USAGE_PATH).read_text(
+                encoding="utf-8")
+            self.assertIn('"input_tokens":11', usage)
+
+
 class TestSafeBatch(unittest.TestCase):
     def test_solo_agrupa_huellas_no_superpuestas(self):
         tasks = [
@@ -62,6 +97,20 @@ class TestSafeBatch(unittest.TestCase):
         ]
         selected = task_worktrees.safe_batch(tasks, {}, 3)
         self.assertEqual([task["id"] for task in selected], ["T-1", "T-2"])
+
+    def test_incluye_defectos_disjuntos(self):
+        tasks = [
+            {"id": "D-1", "kind": "defect", "deliverables": ["src/a.py"]},
+            {"id": "D-2", "kind": "defect", "deliverables": ["src/b.py"]},
+            {"id": "T-3", "kind": "plan", "deliverables": ["src/a.py"]},
+        ]
+        selected = task_worktrees.safe_batch(tasks, {}, 6)
+        self.assertEqual([task["id"] for task in selected], ["D-1", "D-2"])
+
+    def test_ola_ancha_incluye_todas_las_huellas_disjuntas(self):
+        tasks = [{"id": f"T-{index}", "kind": "plan",
+                  "deliverables": [f"src/{index}.py"]} for index in range(5)]
+        self.assertEqual(len(task_worktrees.safe_batch(tasks, {}, 6)), 5)
 
 
 class TestWorktreeRecovery(unittest.TestCase):
@@ -176,9 +225,13 @@ class TestDurableHumanGate(unittest.TestCase):
             state = json.loads((wd / ".agent/state.json").read_text(encoding="utf-8"))
             batches = [event for event in state["history"]
                        if event.get("event") == "BATCH"]
-            self.assertTrue(any(event.get("tareas") == 2 for event in batches))
+            self.assertTrue(any(event.get("tareas", 0) >= 3 for event in batches))
             self.assertEqual(state["status"], "done")
             self.assertTrue(all(task["status"] == "done" for task in state["tasks"]))
+            self.assertEqual(state.get("parallel_results"), {})
+            summary = metrics.summarize(wd)
+            self.assertGreater(summary.get("state_projection", {}).get("count", 0), 0)
+            self.assertGreater(summary.get("agent_process", {}).get("count", 0), 5)
             worktrees = subprocess.run(
                 ["git", "-C", str(wd), "worktree", "list", "--porcelain"],
                 capture_output=True, text=True, check=True).stdout

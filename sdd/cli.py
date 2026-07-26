@@ -24,6 +24,7 @@ import config
 import providers
 import report
 import task_worktrees
+import metrics
 
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "SDD_API_KEY"}
 KEY_ENV.update({p: c["key_env"] for p, c in providers.OPENAI_PRESETS.items()})
@@ -299,6 +300,13 @@ def show(a):
         elif outcome and outcome["event"] == "ESCALATE_HUMAN":
             print(f"        {C.red('⚠ ESCALATE_HUMAN')} {C.gray(outcome['motivo'])}")
     _print_review_backlog(wd)
+    performance = metrics.summarize(wd)
+    if performance:
+        print(C.bold("  RENDIMIENTO"))
+        for operation, values in sorted(
+                performance.items(), key=lambda item: -float(item[1]["duration_ms"])):
+            print(f"        {operation:<20} {int(values['count']):>3}x · "
+                  f"{float(values['duration_ms']):>9.0f} ms")
     print()
     return 0
 
