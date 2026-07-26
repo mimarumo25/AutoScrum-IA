@@ -1,16 +1,16 @@
 """Aislamiento Git y seleccion segura de tareas concurrentes."""
 import json
 import re
-import subprocess
 from pathlib import Path
+
+import process_control
 
 
 def _git(repo: str | Path, *args: str, data: bytes | None = None):
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], input=data, capture_output=True)
+    return process_control.run_git(repo, *args, data=data)
 
 
-def _text(proc: subprocess.CompletedProcess) -> str:
+def _text(proc) -> str:
     raw = proc.stderr or proc.stdout or b""
     return raw.decode("utf-8", errors="replace").strip()
 

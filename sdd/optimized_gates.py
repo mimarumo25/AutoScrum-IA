@@ -7,13 +7,13 @@ import hashlib
 import json
 import os
 import shlex
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import metrics
+import process_control
 
 GATES = Path(__file__).resolve().parent / "gates"
 sys.path.insert(0, str(GATES))
@@ -30,7 +30,7 @@ def _task(workdir: str) -> dict[str, object]:
 
 
 def _execute_gate(gate: dict[str, object], node_id: str,
-                  workdir: str) -> dict[str, object]:
+                  workdir: str, pipeline: dict[str, object]) -> dict[str, object]:
     cmd = str(gate["cmd"]).format(
         py=shlex.quote(sys.executable), workdir=Path(workdir).as_posix(),
         gates=GATES.as_posix(), root=GATES.parent.as_posix(), node=node_id)
@@ -42,14 +42,24 @@ def _execute_gate(gate: dict[str, object], node_id: str,
     if str(gate["id"]).startswith("R") and env.get("SDD_REVIEW_MODEL"):
         env["SDD_MODEL"] = env["SDD_REVIEW_MODEL"]
     started = time.perf_counter()
-    proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True, env=env)
+    proc, timed_out = process_control.run_bounded(
+        shlex.split(cmd), env=env,
+        timeout_seconds_value=float(pipeline["runtime"]["gate_timeout_seconds"]))
     try:
         findings = json.loads(proc.stdout or "{}").get("findings", [])
     except (json.JSONDecodeError, AttributeError):
         findings = [{
             "file": str(gate["cmd"]).split()[1], "line": 0,
-            "rule": "gate-roto",
-            "evidence": (proc.stderr or proc.stdout)[-300:].strip(),
+            "rule": "gate-timeout" if timed_out else "gate-roto",
+            "evidence": ("gate excedio el tiempo configurado" if timed_out else
+                         (proc.stderr or proc.stdout)[-300:].strip()),
+        }]
+    if proc.returncode != 0 and not findings:
+        findings = [{
+            "file": str(gate["cmd"]).split()[1], "line": 0,
+            "rule": "gate-timeout" if timed_out else "gate-roto",
+            "evidence": "gate excedio el tiempo configurado" if timed_out else
+                        (proc.stderr or proc.stdout or "salida no valida")[-300:].strip(),
         }]
     prefix = Path(workdir).as_posix().rstrip("/") + "/"
     for finding in findings:
@@ -91,7 +101,7 @@ def _review_digest(gate: dict[str, object], node_id: str,
 def _run_cached(gate: dict[str, object], node_id: str, workdir: str,
                 pipeline: dict[str, object]) -> dict[str, object]:
     if not str(gate["id"]).startswith("R"):
-        return _execute_gate(gate, node_id, workdir)
+        return _execute_gate(gate, node_id, workdir, pipeline)
     digest = _review_digest(gate, node_id, workdir, pipeline)
     task_id = str(_task(workdir).get("id", "linear"))
     path = (Path(workdir) / ".agent/review-cache" /
@@ -101,7 +111,7 @@ def _run_cached(gate: dict[str, object], node_id: str, workdir: str,
         metrics.record(workdir, "gate_process", duration_ms=0, gate=gate["id"],
                        node=node_id, task=task_id, cache_hit=True)
         return report
-    report = _execute_gate(gate, node_id, workdir)
+    report = _execute_gate(gate, node_id, workdir, pipeline)
     if report["status"] == "pass":
         path.parent.mkdir(parents=True, exist_ok=True)
         pending = path.with_suffix(".tmp")

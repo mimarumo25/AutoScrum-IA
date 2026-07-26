@@ -97,6 +97,12 @@ reescribir todo el estado en cada nodo. `.agent/metrics.jsonl` y
 resto de G* corre concurrentemente y las revisiones verdes R1/R2 se cachean por
 contenido.
 
+La exclusión por proyecto impide dos orquestadores sobre el mismo estado. El
+lease se toma antes de leer `state.json`; `run`, `gates` y `clean` comparten el
+mismo protocolo y fallan rápido ante contención. Agentes, proveedores, gates y
+Git tienen timeouts configurables, y la reserva `starting` del panel es atómica.
+Ningún lock interno se mantiene mientras se espera otro lock interno.
+
 ## Lo que NO está hecho (ver la auditoría del sistema)
 
 - El modo real **no se ha ejecutado contra un modelo**: todo lo verificado es el

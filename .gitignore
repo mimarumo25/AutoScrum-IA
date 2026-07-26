@@ -4,6 +4,7 @@ __pycache__/
 *.egg-info/
 .tmp-test/
 .agent/
+.sdd-locks/
 ../demo-repo/
 config.json
 project/

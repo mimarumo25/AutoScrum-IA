@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 import providers  # noqa: E402
 import report  # noqa: E402
+import process_control  # noqa: E402
 import tomllib  # noqa: E402
 from webpage import PAGE  # noqa: E402  plantilla HTML del panel (modulo aparte)
 
@@ -35,7 +36,22 @@ KEY_ENV.update({p: c["key_env"] for p, c in providers.OPENAI_PRESETS.items()})
 
 
 def _git(wd, *args):
-    subprocess.run(["git", "-C", str(wd), *args], capture_output=True, text=True)
+    process_control.run_git(wd, *args, text=True)
+
+
+def _claim_run() -> bool:
+    """Reserva atomica: dos POST concurrentes no pueden iniciar dos corridas."""
+    with _LOCK:
+        if RUN["status"] in ("starting", "running"):
+            return False
+        RUN["status"] = "starting"
+        return True
+
+
+def _release_claim() -> None:
+    with _LOCK:
+        if RUN["status"] == "starting":
+            RUN["status"] = "idle"
 
 
 def _seed(wd: Path, idea: str):
@@ -58,19 +74,25 @@ def _run_pipeline(wd: Path, env: dict, extra=()):
     # Al reanudar, el log se ABRE en modo append para no borrar el historial de la
     # corrida anterior; en una corrida nueva se sobreescribe.
     mode = "a" if "--resume" in extra else "w"
-    fh = logfile.open(mode, encoding="utf-8")
-    proc = subprocess.Popen(
-        [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd), *extra],
-        cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1)
-    for line in proc.stdout:
-        line = line.rstrip("\n")
+    try:
+        with logfile.open(mode, encoding="utf-8") as fh:
+            proc = subprocess.Popen(
+                [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd), *extra],
+                cwd=str(ROOT), env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in proc.stdout or ():
+                line = line.rstrip("\n")
+                with _LOCK:
+                    RUN["log"].append(line)
+                fh.write(line + "\n")
+                fh.flush()
+            proc.wait()
+    except Exception as error:  # noqa: BLE001
         with _LOCK:
-            RUN["log"].append(line)
-        fh.write(line + "\n"); fh.flush()
-    proc.wait(); fh.close()
-    with _LOCK:
-        RUN["status"] = "done"
+            RUN["log"].append(f"ERROR: {error}")
+    finally:
+        with _LOCK:
+            RUN["status"] = "done"
 
 
 def _env_for(provider: str, model: str, key: str) -> dict:
@@ -221,23 +243,25 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/config":
-            self._send(200, json.dumps(config.save(self._body())))
+            with _LOCK:
+                saved = config.save(self._body())
+            self._send(200, json.dumps(saved))
             return
         if self.path not in ("/run", "/resume"):
             self._send(404, "{}")
             return
         body = self._body()
-        with _LOCK:
-            busy = RUN["status"] == "running"
-        if busy:
+        if not _claim_run():
             self._send(409, json.dumps({"error": "ya hay una corrida en curso"}))
             return
         try:
             wd = _resume(body) if self.path == "/resume" else _start(body)
         except Exception as e:  # noqa: BLE001
+            _release_claim()
             self._send(500, json.dumps({"error": str(e)}))
             return
         if wd is None:   # solo /resume: no habia corrida previa que continuar
+            _release_claim()
             self._send(409, json.dumps({"error": "este proyecto no tiene una corrida que continuar"}))
             return
         self._send(200, json.dumps({"ok": True, "workdir": str(wd)}))

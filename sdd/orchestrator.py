@@ -23,7 +23,6 @@ import argparse
 import json
 import os
 import shlex
-import subprocess
 import sys
 import time
 import tomllib
@@ -37,6 +36,9 @@ import taskqueue  # noqa: E402
 import graph_runtime  # noqa: E402
 import metrics  # noqa: E402
 import plan_analysis  # noqa: E402
+import process_control  # noqa: E402
+import run_lease  # noqa: E402
+from run_lease import RunBusyError  # noqa: E402
 from execution_journal import invoke_once  # noqa: E402
 from report import write_run_report  # noqa: E402
 from optimized_gates import run_node_gates  # noqa: E402
@@ -118,7 +120,7 @@ def save(state, path):
 
 
 def git(workdir, *args):
-    return subprocess.run(["git", *args], cwd=workdir, capture_output=True, text=True)
+    return process_control.run_git(workdir, *args, text=True)
 
 
 def token_usage(workdir):
@@ -204,13 +206,16 @@ def invoke_agent(node, workdir, cfg, simulate, task):
                SDD_METRICS_NODE=str(node["id"]),
                SDD_METRICS_TASK=task_id)
     started = time.perf_counter()
-    proc = subprocess.run(shlex.split(cmd), cwd=workdir, capture_output=True,
-                          text=True, env=env)
+    proc, timed_out = process_control.run_bounded(
+        shlex.split(cmd), cwd=workdir, env=env,
+        timeout_seconds_value=float(cfg["runtime"]["agent_timeout_seconds"]))
     metrics.record(workdir, "agent_process",
                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
                    node=node["id"], task=task_id,
-                   simulate=bool(simulate), returncode=proc.returncode)
-    err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")
+                   simulate=bool(simulate), returncode=proc.returncode,
+                   timed_out=timed_out)
+    err = (proc.stderr or ("agente excedio el tiempo configurado" if timed_out else
+                           proc.stdout) or "").strip().replace("\n", " ")
     return proc.returncode, err[-220:]
 
 
@@ -427,6 +432,12 @@ def main():
         os.environ["SDD_SIMULATE"] = "1"
 
     cfg = tomllib.loads((ROOT / "pipeline.toml").read_text(encoding="utf-8"))
+    try:
+        run_lease.hold_until_exit(
+            args.workdir, float(cfg["runtime"]["lease_wait_seconds"]))
+    except RunBusyError as error:
+        print(f"corrida rechazada: {error}", flush=True)
+        return 2
     nodes = {n["id"]: n for n in cfg["node"]}
     existed = (Path(args.workdir) / ".agent/state.json").exists()
     state, spath = load_state(args.workdir, args.start or "product")

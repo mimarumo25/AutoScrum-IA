@@ -194,6 +194,22 @@ es donde enchufas eslint/ruff, tsc/mypy, gitleaks/semgrep y `--cov-fail-under`.
 asíncrona; los gates deterministas se ejecutan en paralelo después de G7. R1/R2
 solo corren cuando todos los G* están verdes y los resultados verdes se reutilizan
 mientras el hash de tarea, prompt y artefactos no cambie.
+
+### Protección contra deadlocks y esperas indefinidas
+
+Cada proyecto tiene un lease entre procesos adquirido antes de leer su estado.
+Una segunda corrida, `sdd gates` o `sdd clean` sobre el mismo proyecto falla
+rápido en vez de competir por SQLite o por el índice Git. En el panel, el estado
+`starting` se reserva bajo un lock antes de sembrar o reanudar, así dos POST
+simultáneos no pueden arrancar dos procesos.
+
+Los límites `agent_timeout_seconds`, `gate_timeout_seconds`,
+`provider_timeout_seconds`, `git_timeout_seconds` y `lease_wait_seconds` viven en
+`pipeline.toml [runtime]`. Un timeout de agente se enruta como defecto; uno de
+gate produce un gate rojo; Git deshabilita prompts interactivos y devuelve un
+fallo acotado. El orden es siempre lease del proyecto → operación Git; el lock de
+métricas solo protege una escritura y nunca se conserva mientras se espera un
+subproceso.
 Verifica los flags contra
 https://docs.claude.com/en/docs/claude-code/overview antes de usarlo: cambian entre
 versiones. El aislamiento por path se consigue con `git worktree` por tarea mas los

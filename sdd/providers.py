@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 
 import metrics
+import process_control
 
 
 class ProviderError(RuntimeError):
@@ -242,7 +243,8 @@ def _anthropic(system: str, user: str) -> str:
         raise ProviderError(
             "el proveedor 'anthropic' requiere el SDK: pip install anthropic") from e
     model = os.environ.get("SDD_MODEL", ANTHROPIC_DEFAULT_MODEL)
-    client = anthropic.Anthropic()  # lee ANTHROPIC_API_KEY del entorno
+    client = anthropic.Anthropic(
+        timeout=process_control.timeout_seconds("provider_timeout_seconds"))
 
     def call(prefill: str):
         messages = [{"role": "user", "content": user}]
@@ -305,7 +307,9 @@ def _openai_compatible(provider: str, system: str, user: str) -> str:
                 headers={"Authorization": f"Bearer {key}",
                          "Content-Type": "application/json"})
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
+                with urllib.request.urlopen(
+                        req, timeout=process_control.timeout_seconds(
+                            "provider_timeout_seconds")) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:300]

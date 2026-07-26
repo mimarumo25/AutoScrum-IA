@@ -14,7 +14,7 @@ import optimized_gates  # noqa: E402
 
 
 def pipeline():
-    return {"runtime": {"gate_concurrency": 4}, "node": [{
+    return {"runtime": {"gate_concurrency": 4, "gate_timeout_seconds": 2}, "node": [{
         "id": "dev_backend", "writes": ["src/"],
         "gates": ["G7", "G0", "G4", "G5", "G6", "R2"],
     }]}
@@ -71,7 +71,7 @@ class TestConcurrentGates(unittest.TestCase):
         review_gate = optimized_gates.load_registry()["R2"]
         calls = []
 
-        def fake(gate, _node, _workdir):
+        def fake(gate, _node, _workdir, _pipeline):
             calls.append(gate["id"])
             return report(gate)
 

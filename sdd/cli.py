@@ -25,6 +25,8 @@ import providers
 import report
 import task_worktrees
 import metrics
+import process_control
+import run_lease
 
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "SDD_API_KEY"}
 KEY_ENV.update({p: c["key_env"] for p, c in providers.OPENAI_PRESETS.items()})
@@ -53,7 +55,7 @@ def sh(*args, **kw):
 
 
 def git(workdir, *args):
-    return sh("git", "-C", str(workdir), *args)
+    return process_control.run_git(workdir, *args, check=True)
 
 
 def demo(a):
@@ -72,8 +74,18 @@ def demo(a):
 
 
 def gates(a):
-    return subprocess.run([PY, ROOT / "gates/run_gates.py",
-                           "--node", a.node, "--workdir", a.workdir]).returncode
+    try:
+        with run_lease.acquire(
+                a.workdir, process_control.timeout_seconds("lease_wait_seconds")):
+            result, _ = process_control.run_bounded(
+                [PY, str(ROOT / "gates/run_gates.py"), "--node", a.node,
+                 "--workdir", a.workdir],
+                timeout_seconds_value=process_control.timeout_seconds(
+                    "gate_timeout_seconds"))
+            return result.returncode
+    except run_lease.RunBusyError as error:
+        print(f"gates rechazados: {error}")
+        return 2
 
 
 def _seed_repo(wd, intake_src):
@@ -164,6 +176,16 @@ def resume(a):
 
 def clean(a):
     workdir = Path(a.workdir).resolve()
+    try:
+        with run_lease.acquire(
+                workdir, process_control.timeout_seconds("lease_wait_seconds")):
+            return _clean_workdir(workdir)
+    except run_lease.RunBusyError as error:
+        print(f"limpieza rechazada: {error}")
+        return 2
+
+
+def _clean_workdir(workdir: Path):
     agent_dir = workdir / ".agent"
     state_path = agent_dir / "state.json"
     if state_path.exists():
@@ -175,8 +197,7 @@ def clean(a):
         except (OSError, json.JSONDecodeError, RuntimeError) as exc:
             print(f"no se puede limpiar con seguridad: {exc}")
             return 1
-    subprocess.run(["git", "-C", str(workdir), "worktree", "prune"],
-                   capture_output=True)
+    process_control.run_git(workdir, "worktree", "prune")
     if agent_dir.exists():
         shutil.rmtree(agent_dir)
     print(f"limpiado {agent_dir}")

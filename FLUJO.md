@@ -322,6 +322,15 @@ Si sigue truncando tras 6 continuaciones, el error lo dice claro: *la tarea es
 demasiado grande, divide el plan*. Eso apunta al planner, que es donde está el
 problema de verdad.
 
+### Liveness y exclusión
+
+Antes de leer el estado, el orquestador obtiene un lease exclusivo por proyecto.
+La jerarquía es `lease del proyecto → Git`; el colector es el único que integra
+en la rama principal. Los workers usan ramas e índices separados. Los locks de
+memoria del panel y métricas cubren solo actualizaciones pequeñas y se liberan
+antes de esperar procesos, red o Git. Toda espera externa tiene timeout; al
+agotarse se convierte en un fallo explícito y recuperable, nunca en verde.
+
 ---
 
 ## Límites de este flujo
