@@ -19,6 +19,7 @@ Guion (modo normal):
 
 Con SDD_FAKE_STUCK el agente NUNCA corrige: ejercita el techo de reintentos y la
 escalacion a humano (ESCALATE_HUMAN).
+Con SDD_FAKE_PARALLEL T-002 y T-003 quedan listas juntas para probar Send workers.
 """
 import json
 import os
@@ -27,6 +28,7 @@ import sys
 from pathlib import Path
 
 STUCK = bool(os.environ.get("SDD_FAKE_STUCK"))
+PARALLEL = bool(os.environ.get("SDD_FAKE_PARALLEL"))
 node, workdir = sys.argv[1], Path(sys.argv[2])
 
 _task_path = workdir / ".agent/current_task.json"
@@ -120,7 +122,8 @@ test: {PYCMD} -m unittest discover -s tests -v
 """)
 
 elif node == "planner":
-    w("spec/30_plan/tasks.yaml", """
+    frontend_dep = "[T-001]" if PARALLEL else "[T-002]"
+    w("spec/30_plan/tasks.yaml", f"""
 tasks:
   - id: T-001
     title: reglas de renovacion de matricula
@@ -149,7 +152,7 @@ tasks:
     fr_refs: [FR-001]
     deliverables: [src/web/renovacion.js]
     context: [spec/20_arch/api/openapi.yaml]
-    depends_on: [T-002]
+    depends_on: {frontend_dep}
     acceptance: la vista expone los estados loading, empty, error y success
 
   - id: T-004

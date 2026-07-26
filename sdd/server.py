@@ -60,7 +60,7 @@ def _run_pipeline(wd: Path, env: dict, extra=()):
     mode = "a" if "--resume" in extra else "w"
     fh = logfile.open(mode, encoding="utf-8")
     proc = subprocess.Popen(
-        [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd), "--autonomous", *extra],
+        [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd), *extra],
         cwd=str(ROOT), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, bufsize=1)
     for line in proc.stdout:
@@ -95,6 +95,7 @@ def _resume(body):
     provider = cfg.get("provider") or "anthropic"
     key = cfg["keys"].get(provider, "")
     env = _env_for(provider, cfg.get("model") or "", key)
+    env["SDD_APPROVAL_ACTOR"] = "web"
     with _LOCK:
         RUN.update(status="running", workdir=str(wd), log=[],
                    provider=provider, project=project, task=task)
@@ -144,15 +145,20 @@ def _sprint_from(state_path: Path):
 def _state():
     with _LOCK:
         snap = dict(RUN); snap["log"] = list(RUN["log"])
-    steps, nodes, final, sprint = [], [], None, []
+    steps, nodes, final, sprint, engine = [], [], None, [], None
     if snap["workdir"]:
         sp = Path(snap["workdir"]) / ".agent/state.json"
         if sp.exists():
             steps, nodes, final = _steps_from(sp)
             sprint = _sprint_from(sp)
+            try:
+                engine = json.loads(sp.read_text(encoding="utf-8")).get("engine")
+            except (ValueError, OSError):
+                pass
     return {"status": snap["status"], "final": final, "provider": snap["provider"],
             "project": snap["project"], "task": snap["task"],
-            "steps": steps, "nodes": nodes, "sprint": sprint, "log": snap["log"]}
+            "engine": engine, "steps": steps, "nodes": nodes,
+            "sprint": sprint, "log": snap["log"]}
 
 
 def _task_view(project, task):
@@ -162,9 +168,13 @@ def _task_view(project, task):
         return {"status": "idle", "final": "sin correr", "provider": None,
                 "project": project, "task": task, "steps": [], "nodes": [], "log": []}
     steps, nodes, final = _steps_from(sp)
+    try:
+        engine = json.loads(sp.read_text(encoding="utf-8")).get("engine")
+    except (ValueError, OSError):
+        engine = None
     lf = wd / ".agent/run.log"
     log = lf.read_text(encoding="utf-8", errors="replace").splitlines() if lf.exists() else []
-    return {"status": "idle", "final": final, "provider": None,
+    return {"status": "idle", "final": final, "provider": None, "engine": engine,
             "project": project, "task": task, "steps": steps, "nodes": nodes, "log": log}
 
 

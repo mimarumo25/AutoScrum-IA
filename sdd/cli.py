@@ -23,6 +23,7 @@ from pathlib import Path
 import config
 import providers
 import report
+import task_worktrees
 
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "SDD_API_KEY"}
 KEY_ENV.update({p: c["key_env"] for p, c in providers.OPENAI_PRESETS.items()})
@@ -161,7 +162,20 @@ def resume(a):
 
 
 def clean(a):
-    agent_dir = Path(a.workdir) / ".agent"
+    workdir = Path(a.workdir).resolve()
+    agent_dir = workdir / ".agent"
+    state_path = agent_dir / "state.json"
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            for task in state.get("tasks", []):
+                if isinstance(task, dict) and task.get("workspace"):
+                    task_worktrees.cleanup(str(workdir), task)
+        except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+            print(f"no se puede limpiar con seguridad: {exc}")
+            return 1
+    subprocess.run(["git", "-C", str(workdir), "worktree", "prune"],
+                   capture_output=True)
     if agent_dir.exists():
         shutil.rmtree(agent_dir)
     print(f"limpiado {agent_dir}")
@@ -230,7 +244,10 @@ def show(a):
     color = {"done": C.green, "escalated": C.red,
              "waiting_human": C.yellow, "running": C.cyan}.get(st["status"], C.bold)
     retries = sum(st.get("attempts", {}).values())
+    engine = st.get("engine", "legacy")
     print(f"\n{C.bold('PIPELINE SDD')}  {C.gray(str(wd))}")
+    print(f"runtime: {C.cyan(engine)} · checkpoints: "
+          f"{C.gray(st.get('checkpoint_db', 'n/d'))}")
     print(f"estado: {color(st['status'])} · {st['agent_calls']} llamadas · "
           f"{retries} reintento(s)\n")
 

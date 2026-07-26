@@ -1,4 +1,4 @@
-# Pipeline SDD multi-agente — andamiaje v0
+# Pipeline SDD multi-agente — LangGraph v0.2
 
 Plano de control primero: los gates y la propiedad de paths son lo que hace utilizable
 un pipeline de agentes. El orquestador es la pieza barata.
@@ -8,8 +8,11 @@ un pipeline de agentes. El orquestador es la pieza barata.
 | Archivo | Rol |
 |---|---|
 | `pipeline.toml` | grafo, propiedad de paths, entregables exigidos, presupuesto |
-| `orchestrator.py` | maquina de estados + supervisor (router puro, sin juicio) |
+| `graph_runtime.py` | StateGraph, checkpoints SQLite e interrupt humano |
+| `orchestrator.py` | supervisor y reglas de dominio (router puro, sin juicio) |
 | `taskqueue.py` | la cola del sprint: dependencias, bloqueos y tareas de defecto |
+| `parallel_tasks.py` | scheduler, Send workers y colector de resultados |
+| `task_worktrees.py` | aislamiento e integracion Git por tarea |
 | `gates/registry.toml` | registro declarativo de gates y su enrutamiento |
 | `gates/check_*.py` | checkers deterministas (`G*`) + la revision critica (`R1`) |
 | `agents/*.md` | los seis system prompts + el del revisor |
@@ -21,8 +24,10 @@ un pipeline de agentes. El orquestador es la pieza barata.
 especificacion y, sobre todo, `spec/30_plan/tasks.yaml`: el corte del sistema en
 tareas con dueno, entregables, dependencias y criterio de aceptacion.
 
-**Bucle de tareas** — el plan se ejecuta tarea a tarea respetando dependencias.
-Cada tarea es una llamada acotada a un agente, sus gates y su propio commit. Un
+**Sprint de tareas** — LangGraph despacha las tareas con dependencias cerradas.
+Las que no comparten entregables corren en paralelo, cada una dentro de su propio
+Git worktree; el colector integra sus deltas en orden determinista. Cada tarea es
+una llamada acotada a un agente, sus gates y su propio commit. Un
 defecto que pertenece a otro nodo no es un reintento a ciegas: se convierte en una
 tarea `D-###` para su dueno, y la tarea que lo destapo queda bloqueada hasta que
 cierre. Eso es lo que hace que el sistema se comporte como un equipo y no como una
@@ -75,7 +80,7 @@ todo — CLI y panel web. Instálala una vez y úsala:
     sdd gates --node dev_backend --workdir <repo>
 
 Sin instalar, lo mismo con `python -m sdd <cmd>`. `sdd demo` termina en
-`estado final: done | tareas: 5/5` tras **12 llamadas simuladas**. El guion no es
+`estado final: done | tareas: 5/5`. El guion no es
 decorativo: construye un proyecto Python real, ejercita una violación de propiedad
 revertida por G7, y planta un defecto de dominio que **solo una prueba ejecutada
 revela** — G9 lo detecta, el supervisor lo atribuye a `src/domain/` y abre una
@@ -88,7 +93,11 @@ tarea de defecto para el backend, que la cierra y desbloquea a QA. No consume to
       __main__.py            punto de entrada único (sdd / python -m sdd)
       cli.py                 dispatcher de subcomandos (CLI)
       server.py              panel web (stdlib http.server)
-      orchestrator.py        máquina de estados + supervisor (router puro)
+      graph_runtime.py       StateGraph + SQLite + interrupt humano
+      parallel_tasks.py      scheduler + Send workers + colector
+      task_worktrees.py      worktree, integración y limpieza por tarea
+      execution_journal.py   idempotencia de visitas externas completadas
+      orchestrator.py        supervisor y reglas deterministas de ruta
       taskqueue.py           cola de tareas: dependencias, bloqueos, defectos
       agent.py               agente real (llama al modelo, escribe archivos)
       providers.py           Anthropic + modelos chinos (compat. OpenAI)
@@ -164,24 +173,27 @@ es donde enchufas eslint/ruff, tsc/mypy, gitleaks/semgrep y `--cov-fail-under`.
 
 ## Invocacion real del agente
 
-`pipeline.toml` seccion `[runtime]`, clave `agent_cmd`. Verifica los flags contra
+`pipeline.toml` seccion `[runtime]`, claves `agent_cmd` y `max_concurrency`.
+Verifica los flags contra
 https://docs.claude.com/en/docs/claude-code/overview antes de usarlo: cambian entre
-versiones. El aislamiento por path se consigue con `git worktree` por nodo mas los
+versiones. El aislamiento por path se consigue con `git worktree` por tarea mas los
 permisos de herramienta del CLI; `pipeline.toml` declara la propiedad, y G7 la verifica
 a posteriori con `git status`. Las dos capas son necesarias: la preventiva puede
 configurarse mal, la verificadora no depende del agente.
 
 ## Limites conocidos
 
-- **Secuencial.** El plan ya declara dependencias, asi que las tareas sin relacion
-  entre si *podrian* correr en paralelo; el bucle todavia las ejecuta de una en una.
-  Es el siguiente cambio de mayor impacto en tiempo de pared.
-- **Sin persistencia durable**: si el proceso muere a mitad de nodo, se relanza el
-  nodo. El estado por tarea sobrevive en `.agent/state.json`, asi que no se pierde
-  el sprint entero.
+- **SQLite es local.** `.agent/checkpoints.sqlite` es adecuado para esta aplicacion
+  local y sincronica. Un servicio con varios procesos debe usar un checkpointer
+  PostgreSQL; `state.json` es solo la proyeccion legible para CLI y panel.
+- **La ventana exactamente-una-vez depende del proveedor.** El journal evita
+  repetir una visita completada si el proceso cae antes del checkpoint, pero un
+  corte entre la respuesta del modelo y el journal solo se cierra con una
+  idempotency key soportada por la API externa.
 - **El presupuesto cuenta llamadas, no tokens ni USD.** Instrumentar antes de
   dejarlo solo.
 - **Sin retroalimentacion entre corridas**: un defecto que se repite en todos los
   proyectos deberia acabar en el prompt del nodo, y hoy no lo hace.
-- `cli.py` (563 lineas) y `server.py` (514) superan el limite duro de 500 que el
-  propio `CLAUDE.md` exige al codigo generado. Deuda pendiente de dividir.
+- **El modo real aun necesita medicion.** El runtime, los gates, la recuperacion y
+  el paralelismo se verifican con agentes simulados; falta medir calidad y coste
+  con modelos reales.

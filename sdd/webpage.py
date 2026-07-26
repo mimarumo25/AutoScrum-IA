@@ -253,7 +253,8 @@ function paint(s){
  const map={running:["run","ejecutando"],done:["ok","completado"],escalated:["err","escalado"],waiting_human:["run","gate humano"],idle:["","en reposo"]};
  const k=s.status==="running"?"running":(s.final||"idle");const m=map[k]||["","en reposo"];
  $("status").className="badge "+m[0];$("statustxt").textContent=m[1];
- $("prov").textContent=s.provider?("· "+s.provider):"";
+ const runtime=s.engine==="langgraph"?"LangGraph":"";
+ $("prov").textContent=[s.provider,runtime].filter(Boolean).map(x=>"· "+x).join(" ");
  $("viewbar").textContent=s.project?("proyecto: "+s.project+"   ·   tarea: "+s.task):"";
  const done=new Set(s.steps.filter(x=>x.commit).map(x=>x.node));
  const cur=s.steps.length?s.steps[s.steps.length-1]:null;
@@ -301,7 +302,8 @@ function loadTasks(){const p=$("projsel").value;if(!p){$("tasklist").innerHTML='
   // proceso murio y quedo 'running' rancio): retoma sin perder lo ya commiteado.
   const resumable=t=>["escalated","waiting_human","running"].includes(t.final);
   $("tasklist").innerHTML=list.map(t=>{const c=cls[t.final]||"idle";const pct=Math.round(100*t.done/(t.total||5));
-   const btn=resumable(t)?`<button class="btn btn-ghost resumebtn" data-t="${esc(t.task)}">▸ Continuar</button>`:"";
+   const action=t.final==="waiting_human"?"✓ Aprobar y continuar":"▸ Continuar";
+   const btn=resumable(t)?`<button class="btn btn-ghost resumebtn" data-t="${esc(t.task)}">${action}</button>`:"";
    return `<div class=taskitem data-t="${esc(t.task)}"><div class=row><span class=tn>${esc(t.task)}</span><span class="mini ${c}">${esc(t.final)}</span></div><div class=bar><i style="width:${pct}%"></i></div><div class=taskmeta>${t.done}/${t.total} nodos · ${t.calls} llamadas</div>${btn?'<div class=row style="margin-top:8px">'+btn+'</div>':''}</div>`}).join("");
   document.querySelectorAll(".taskitem").forEach(el=>el.onclick=()=>viewTask(p,el.dataset.t));
   document.querySelectorAll(".resumebtn").forEach(b=>b.onclick=ev=>{ev.stopPropagation();resumeTask(p,b.dataset.t)})})}

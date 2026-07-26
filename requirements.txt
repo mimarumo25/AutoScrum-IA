@@ -1,9 +1,9 @@
-# v0 del plano de control: SOLO biblioteca estandar.
-# - tomllib requiere Python >= 3.11 (ya en la stdlib; no se instala)
-# - los checkers de andamiaje (gates/check_*.py) usan solo stdlib
-# Por eso este archivo esta practicamente vacio: `make demo` no necesita nada.
+# Runtime durable del plano de control. LangGraph modela el flujo y SQLite
+# conserva checkpoints locales; los gates deterministas siguen usando stdlib.
+langgraph>=1.2,<2
+langgraph-checkpoint-sqlite>=3.1,<4
 #
-# Primera dependencia real cuando aterrice G0 (validar 00_intake.yaml):
+# Validacion de planes y especificaciones YAML:
 PyYAML>=6.0
 #
 # Modo REAL (agentes que llaman a un modelo):

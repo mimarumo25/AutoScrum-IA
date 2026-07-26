@@ -27,12 +27,15 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "gates"))
 import taskqueue  # noqa: E402
+import graph_runtime  # noqa: E402
+from execution_journal import invoke_once  # noqa: E402
 from report import write_run_report  # noqa: E402
 from run_gates import run_node_gates  # noqa: E402
 
@@ -84,7 +87,8 @@ def load_state(workdir, start):
     if path.exists():
         return json.loads(path.read_text(encoding="utf-8")), path
     state = {
-        "run_id": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "run_id": (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-")
+                   + uuid.uuid4().hex[:8]),
         "cursor": start,
         "status": "running",
         "attempts": {},
@@ -100,7 +104,11 @@ def load_state(workdir, start):
 
 
 def save(state, path):
-    path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pending = path.with_suffix(".json.tmp")
+    pending.write_text(
+        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    pending.replace(path)
 
 
 def git(workdir, *args):
@@ -345,7 +353,11 @@ def step(state, args, cfg, nodes, auto_human):
 
     state["agent_calls"] += 1
     write_baseline(args.workdir)
-    rc, detail = invoke_agent(node, args.workdir, cfg, args.simulate, args.task)
+    rc, detail = invoke_once(
+        args.workdir,
+        getattr(args, "visit_id", None),
+        lambda: invoke_agent(node, args.workdir, cfg, args.simulate, args.task),
+    )
     log(state, "AGENTE", nodo=node["id"], tarea=task["id"] if task else "-",
         resultado="human" if detail == "human" else f"exit={rc}"
                   + (f" · {detail}" if rc != 0 and detail else ""))
@@ -399,7 +411,13 @@ def main():
     if args.start:
         # --from explicito reanuda: antes se ignoraba si ya habia state.json, asi
         # que salir del gate humano era imposible — volvia a pararse en el mismo sitio.
+        previous = state.get("status")
         state["cursor"], state["status"] = args.start, "running"
+        state["attempts"] = {}
+        state["resume_at"] = None
+        if previous == "waiting_human" and args.start != "human_gate":
+            state["human_approval"] = graph_runtime.approval_record(
+                args.workdir, "cli --from", mode="explicit-node")
     elif args.resume:
         # Reanudar: retomar donde quedo sin perder el trabajo ya commiteado. Sirve
         # tanto para una corrida que se corto (proceso muerto, conexion caida:
@@ -413,12 +431,9 @@ def main():
         prev = state["status"]
         state["status"] = "running"
         state["attempts"] = {}
-        state.pop("resume_at", None)
-        # Si quedo detenido en el gate humano, reanudar equivale a la firma: se
-        # avanza al nodo siguiente en vez de volver a parar ahi.
-        cur = nodes.get(state.get("cursor"))
-        if cur and cur.get("type") == "human":
-            state["cursor"] = cur["next"]
+        state["resume_at"] = None
+        # Si el checkpoint esta en interrupt(), graph_runtime envia Command.resume
+        # para que la firma humana quede dentro del historial durable del grafo.
         log(state, "REANUDADO", desde=state.get("cursor"), estado_previo=prev)
     elif state["status"] != "running":
         # Relanzar un proyecto ya terminado sin --from/--resume era un no-op que
@@ -432,26 +447,9 @@ def main():
         print("  sdd clean       borrar el estado .agent/ y empezar de cero", flush=True)
         return 0 if state["status"] in ("done", "waiting_human") else 1
 
-    # El presupuesto de tiempo cuenta desde el inicio real de la corrida, no desde
-    # esta invocacion: si no, un proyecto reanudado muchas veces nunca lo agota.
-    deadline = state.get("started_at", time.time()) + cfg["budget"]["max_wall_minutes"] * 60
-
-    max_out = cfg["budget"].get("max_output_tokens", 0)
-    while state["status"] == "running":
-        if time.time() > deadline:
-            state["status"] = "escalated"
-            log(state, "PRESUPUESTO", motivo="max_wall_minutes agotado")
-            break
-        if max_out:
-            spent = token_usage(args.workdir)["output_tokens"]
-            if spent > max_out:
-                state["status"] = "escalated"
-                log(state, "PRESUPUESTO",
-                    motivo=f"max_output_tokens agotado ({spent} > {max_out})")
-                break
-        step(state, args, cfg, nodes, auto_human)
-        save(state, spath)
-
+    state = graph_runtime.run_pipeline(
+        state, spath, args, cfg, nodes, auto_human,
+        step, log, save, token_usage, commit, resume_requested=args.resume)
     save(state, spath)
     done, total = taskqueue.progress(state["tasks"])
     print(f"\n== estado final: {state['status']} | llamadas a agente: "

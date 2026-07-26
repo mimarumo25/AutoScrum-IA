@@ -28,8 +28,9 @@ backend, que la cierra y desbloquea a QA.
 
 1. **Lineal** — `product → architect → planner → gate humano`. Produce la
    especificación y `spec/30_plan/tasks.yaml`.
-2. **Bucle de tareas** — el plan se ejecuta tarea a tarea respetando dependencias.
-   Un defecto de otro nodo se vuelve una tarea `D-###` para su dueño.
+2. **Sprint durable** — LangGraph despacha tareas listas con `Send`; las huellas
+   no superpuestas corren en worktrees paralelos y se integran en orden. Un
+   defecto de otro nodo se vuelve una tarea `D-###` para su dueño.
 
 ## Verificación: dos categorías
 
@@ -69,20 +70,21 @@ El pipeline no puede reportar un éxito que no ocurrió:
 2. **`CLAUDE.md` va en la raíz del repo objetivo.** Es lo que hace que Claude Code
    herede las restricciones duras sin repetirlas en cada prompt.
 3. Configura proveedor y API key (`sdd config`, `sdd doctor`) y lanza
-   `sdd run --project <nombre>`. Se detiene en el gate humano tras el plan;
-   reanuda con `--from task_loop`.
+   `sdd run --project <nombre>`. Se detiene mediante `interrupt()` tras el plan;
+   reanuda con `sdd resume` para firmar y continuar.
 
 ## Reanudar una corrida (no perder avances)
 
-El estado vive en `.agent/state.json` y cada nodo/tarea commitea al pasar sus
-gates, asi que una corrida interrumpida (conexion caida, proceso muerto) o
+El estado durable vive en `.agent/checkpoints.sqlite`; `.agent/state.json` es su
+proyeccion legible para el panel y los reportes. Cada nodo/tarea commitea al pasar
+sus gates, asi que una corrida interrumpida (conexion caida, proceso muerto) o
 escalada NO pierde lo hecho. Para continuar desde donde quedo:
 
     sdd resume --workdir project/<nombre>/<tarea>          # desde el cursor guardado
     sdd resume --workdir project/<nombre>/<tarea> --node task_loop   # desde un nodo
 
-En el panel web, la pestaña **Tareas** muestra un boton **▸ Continuar** en cada
-tarea escalada o interrumpida. `--resume` da presupuesto de reintentos fresco (para
+En el panel web, la pestaña **Tareas** muestra **✓ Aprobar y continuar** en el gate
+humano y **▸ Continuar** en una corrida escalada. `--resume` da presupuesto fresco (para
 que lo que fallo se reintente en vez de re-escalar) y conserva los commits previos.
 Nota: el panel debe reiniciarse (`sdd web`) para exponer el boton si estaba abierto
 de antes.
@@ -92,6 +94,7 @@ de antes.
 - El modo real **no se ha ejecutado contra un modelo**: todo lo verificado es el
   plano de control, en simulación y con pruebas. La calidad de los agentes reales
   y del criterio de R1 está sin medir.
-- El bucle es **secuencial**: no paraleliza tareas independientes.
+- SQLite es el checkpointer local; despliegues multiproceso deben migrarlo a
+  PostgreSQL.
 - `config.json` guarda las API keys en claro (mitigado con permisos `600` +
   `.gitignore`, no cifrado).

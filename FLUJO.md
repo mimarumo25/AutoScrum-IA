@@ -24,12 +24,13 @@ flowchart TD
 
     H{{"<b>gate humano</b><br/>firma spec Y plan<br/>antes de escribir código"}}
 
-    subgraph BUCLE ["Bucle de tareas · un turno por tarea"]
+    subgraph BUCLE ["Sprint LangGraph · worktrees por tarea"]
         direction TB
-        SEL{"¿hay tarea ejecutable?<br/>dependencias cerradas"}
-        EXE["nodo dueño de la tarea<br/><b>dev_backend</b> · <b>dev_frontend</b> · <b>qa</b>"]
-        SEL -->|sí| EXE
-        EXE -->|"tarea cerrada"| SEL
+        SEL{"¿qué tareas tienen<br/>dependencias cerradas?"}
+        SEND["<b>Send workers</b><br/>solo huellas no superpuestas"]
+        EXE["worktree aislado por tarea<br/><b>dev_backend</b> · <b>dev_frontend</b> · <b>qa</b>"]
+        COL["colector<br/>gates verdes + integración Git"]
+        SEL -->|sí| SEND --> EXE --> COL --> SEL
     end
 
     OK(["<b>done</b><br/>todas las tareas cerradas"])
@@ -45,9 +46,9 @@ flowchart TD
     style ESC fill:#fecaca,stroke:#b91c1c,color:#000
 ```
 
-En modo `--autonomous` (el del panel web) el gate humano se auto-aprueba, pero solo
-se alcanza tras `product`, `architect` y `planner` en verde: nunca firma sobre un
-plan inválido.
+En modo `--autonomous` (usado por `sdd demo`) el gate se auto-aprueba. CLI y panel
+usan `interrupt()`: guardan el checkpoint y esperan una firma con `sdd resume` o
+**✓ Aprobar y continuar**. Siempre se alcanza tras los tres nodos en verde.
 
 ---
 
@@ -273,11 +274,14 @@ flowchart TD
     end
 
     subgraph EFIMERO [".agent/ · fuera de git, estado de la corrida"]
-        e1["state.json<br/>cursor, tareas, reintentos, historial"]
+        e0["checkpoints.sqlite<br/>fuente durable de LangGraph"]
+        e1["state.json<br/>proyección para CLI y panel"]
         e2["current_task.json<br/>la tarea que toca ahora"]
         e3["baseline.txt<br/>qué estaba sucio antes"]
         e4["reports/&lt;nodo&gt;.&lt;gate&gt;.json<br/>hallazgos del ciclo anterior"]
         e5["REPORT.md<br/>el reporte final"]
+        e6["worktrees/&lt;tarea&gt;/<br/>aislamiento y trabajo bloqueado"]
+        e7["visits/&lt;id&gt;.json<br/>journal idempotente"]
     end
 
     AG["agente de un nodo"]
@@ -287,8 +291,9 @@ flowchart TD
     AG -->|"escribe solo en sus paths"| VERSIONADO
 ```
 
-`state.json` es lo que permite reanudar: `--from task_loop` continúa un sprint a
-medias sin repetir lo ya cerrado.
+`checkpoints.sqlite` permite reanudar desde el último superstep y conserva los
+resultados de ramas hermanas ya completadas. `state.json` no gobierna el grafo:
+es una proyección compatible con el visor, el reporte y corridas antiguas.
 
 ---
 
@@ -319,8 +324,11 @@ problema de verdad.
 
 ## Límites de este flujo
 
-- **Secuencial.** El plan ya declara dependencias, así que las tareas sin relación
-  podrían correr en paralelo; el bucle todavía las ejecuta de una en una.
+- **Checkpoint local.** SQLite sirve para la aplicación síncrona actual; un
+  despliegue multiproceso debe usar PostgreSQL.
+- **Efectos externos.** El journal evita repetir visitas completadas, pero la
+  ventana entre respuesta y journal requiere idempotency keys del proveedor para
+  garantía exactamente-una-vez estricta.
 - **R2 revisa el código por tarea** (`dev_backend`, `dev_frontend`, `qa`), con el
   mismo mecanismo que R1 y estado por tarea. Su criterio real no está medido: en
   `--simulate` no bloquea, y el modo real no se ha ejecutado.
@@ -331,4 +339,4 @@ problema de verdad.
   acabar en el prompt del nodo, y hoy no lo hace.
 - **El presupuesto cuenta llamadas, no tokens ni USD.**
 - **El modo real no se ha ejecutado contra un modelo.** Todo lo de arriba está
-  verificado en simulación y con 78 pruebas.
+  verificado en simulación y con la suite automatizada.

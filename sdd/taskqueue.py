@@ -58,8 +58,8 @@ def by_id(tasks, tid):
     return next((t for t in tasks if t["id"] == tid), None)
 
 
-def next_runnable(tasks):
-    """Primera tarea pending con todas sus dependencias en done.
+def runnable(tasks):
+    """Tareas pending cuyas dependencias ya estan completas.
 
     Las tareas de defecto van primero: cierran el camino de una tarea bloqueada,
     y dejarlas para el final alarga el bucle sin ganar nada.
@@ -67,10 +67,14 @@ def next_runnable(tasks):
     done = {t["id"] for t in tasks if t["status"] == "done"}
     ready = [t for t in tasks if t["status"] == "pending"
              and all(d in done for d in t["depends_on"])]
-    if not ready:
-        return None
     ready.sort(key=lambda t: 0 if t["kind"] == "defect" else 1)
-    return ready[0]
+    return ready
+
+
+def next_runnable(tasks):
+    """Primera tarea ejecutable; compatibilidad con el supervisor unitario."""
+    ready = runnable(tasks)
+    return ready[0] if ready else None
 
 
 def pending(tasks):
