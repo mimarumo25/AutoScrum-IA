@@ -9,6 +9,8 @@ import metrics
 import plan_analysis
 import task_worktrees
 import taskqueue
+import lifecycle
+import chronicle
 
 
 def _scrum_complete(system: str, user: str, workdir: str) -> str:
@@ -52,6 +54,10 @@ class ParallelTasks:
 
     def schedule(self, value):
         current = self.normalize(copy.deepcopy(dict(value)))
+        reconciled = set(taskqueue.reconcile_completed_defects(current["tasks"]))
+        for task in current["tasks"]:
+            if str(task["id"]) in reconciled:
+                task_worktrees.cleanup(self.workdir, task)
         if not current["tasks"]:
             try:
                 current["tasks"] = taskqueue.load_plan(self.workdir)
@@ -141,6 +147,8 @@ class ParallelTasks:
         worker_args = copy.copy(self.args)
         setattr(worker_args, "workdir", str(workspace["path"]))
         taskqueue.publish_current(str(workspace["path"]), task)
+        lifecycle.started(self.workdir, task_id, str(task["node"]),
+                          workspace=str(workspace["path"]), batch_id=batch_id)
 
         while local["status"] == "running":
             active = taskqueue.by_id(local["tasks"], task_id)
@@ -160,6 +168,7 @@ class ParallelTasks:
         task_worktrees.preserve(
             active, [str(path) for path in node.get("writes", [])])
         metrics.transfer(str(workspace["path"]), self.workdir)
+        chronicle.transfer(str(workspace["path"]), self.workdir)
         defect = next((item for item in local["tasks"]
                        if item.get("kind") == "defect"), None)
         if active.get("status") == "done":
@@ -216,19 +225,38 @@ class ParallelTasks:
                 current["status"] = "escalated"
                 self.log_fn(current, "ESCALATE_HUMAN", motivo=detail)
                 return False
-            taskqueue.mark_done(current["tasks"], task_id)
-            task_worktrees.cleanup(self.workdir, task)
+            lifecycle.integrated(self.workdir, task_id, status, detail)
+            done_before = {
+                str(item["id"]) for item in current["tasks"]
+                if item.get("status") == "done"
+            }
+            taskqueue.mark_done(current["tasks"], task_id, self.workdir)
+            completed = [
+                item for item in current["tasks"]
+                if item.get("status") == "done"
+                and str(item["id"]) not in done_before
+            ]
+            for item in completed:
+                task_worktrees.cleanup(self.workdir, item)
             self.log_fn(current, "INTEGRADO", tarea=task_id,
                         accion="commit" if status == "committed" else "sin-commit",
                         detalle=detail)
             return True
         if result["outcome"] == "blocked":
             defect = result.get("defect") or {}
+            limit = int(self.cfg["budget"].get("max_defect_tasks", 12))
+            if current["defect_seq"] >= limit:
+                current["status"] = "escalated"
+                self.log_fn(
+                    current, "ESCALATE_HUMAN",
+                    motivo=f"tope de tareas de defecto alcanzado ({limit})")
+                task_worktrees.cleanup(self.workdir, task)
+                return False
             current["defect_seq"] += 1
             created = taskqueue.make_defect(
                 current["tasks"], str(defect.get("node")),
                 str(defect.get("gate_id")), defect.get("findings", []),
-                task, current["defect_seq"])
+                task, current["defect_seq"], self.workdir)
             provisional_id = str(defect.get("id", ""))
             if provisional_id != created["id"]:
                 current["history"] = [
@@ -239,6 +267,9 @@ class ParallelTasks:
                 self.log_fn(current, "DEFECTO_TAREA", id=created["id"],
                             para=created["node"], bloquea=task_id,
                             gate=created["gate_id"])
+            lifecycle.blocked(self.workdir, task_id, created["id"],
+                              str(created.get("gate_id", "")),
+                              defect.get("findings", []))
             return True
         current["status"] = "escalated"
         self.log_fn(current, "ESCALATE_HUMAN",

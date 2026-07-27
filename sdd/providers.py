@@ -69,6 +69,20 @@ MAX_CONTINUATIONS = int(os.environ.get("SDD_MAX_CONTINUATIONS", "6"))
 MAX_RETRIES = int(os.environ.get("SDD_MAX_RETRIES", "4"))
 BACKOFF_BASE_S = float(os.environ.get("SDD_BACKOFF_BASE_S", "2"))
 
+
+def _max_tokens() -> int:
+    try:
+        return max(1, int(os.environ.get("SDD_MAX_TOKENS", str(MAX_TOKENS))))
+    except ValueError:
+        return MAX_TOKENS
+
+
+def _temperature() -> float:
+    try:
+        return max(0.0, min(2.0, float(os.environ.get("SDD_TEMPERATURE", "0.2"))))
+    except ValueError:
+        return 0.2
+
 TRANSIENT_NAMES = {
     "IncompleteRead", "APIConnectionError", "APITimeoutError", "APIStatusError",
     "RemoteDisconnected", "ConnectionResetError", "ConnectionAbortedError",
@@ -253,7 +267,8 @@ def _anthropic(system: str, user: str) -> str:
 
         def once():
             # Streaming: max_tokens alto sin riesgo de timeout HTTP.
-            kwargs = {"model": model, "max_tokens": MAX_TOKENS,
+            kwargs = {"model": model, "max_tokens": _max_tokens(),
+                      "temperature": _temperature(),
                       "system": system, "messages": messages}
             if os.environ.get("SDD_PROMPT_CACHE", "1") != "0":
                 kwargs["cache_control"] = {"type": "ephemeral"}
@@ -298,7 +313,7 @@ def _openai_compatible(provider: str, system: str, user: str) -> str:
                 msg["prefix"] = True
             messages.append(msg)
         body = json.dumps({"model": model, "messages": messages,
-                           "max_tokens": MAX_TOKENS, "temperature": 0.2,
+                           "max_tokens": _max_tokens(), "temperature": _temperature(),
                            "stream": False}).encode("utf-8")
 
         def once():

@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config  # noqa: E402
 import providers  # noqa: E402
+import chronicle  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
 try:
@@ -247,12 +248,36 @@ def main():
     if node_cfg.get("type") == "human":
         return 0  # el gate humano no invoca modelo
 
+    profile = config.agent_profile(node)
+    if not profile.get("enabled", True):
+        print(f"  [agent] BLOQUEADO: {node} esta desactivado por el operador", file=sys.stderr)
+        return 3
+    provider = str(profile.get("provider") or "").strip()
+    model = str(profile.get("model") or "").strip()
+    if provider:
+        os.environ["SDD_PROVIDER"] = provider
+        key_env = ("ANTHROPIC_API_KEY" if provider == "anthropic" else
+                   "SDD_API_KEY" if provider == "openai" else
+                   (providers.OPENAI_PRESETS.get(provider) or {}).get("key_env", ""))
+        key = config.load().get("keys", {}).get(provider, "")
+        if key_env and key:
+            os.environ[key_env] = key
+    if model:
+        os.environ["SDD_MODEL"] = model
+    os.environ["SDD_TEMPERATURE"] = str(profile.get("temperature", 0.2))
+    if int(profile.get("max_tokens") or 0) > 0:
+        os.environ["SDD_MAX_TOKENS"] = str(profile["max_tokens"])
+
     allowed = node_cfg.get("writes", [])
     system_prompt = (ROOT / node_cfg["prompt"]).read_text(encoding="utf-8")
-    addon = (config.load().get("agent_addons", {}).get(node) or "").strip()
+    addon = str(profile.get("prompt_addon") or "").strip()
     if addon:
         system_prompt += ("\n\n## Complemento del operador (aplícalo además de lo anterior)\n"
                           + addon)
+    tools = [str(tool) for tool in profile.get("tools", []) if str(tool).strip()]
+    if tools:
+        system_prompt += ("\n\n## Capacidades habilitadas por el operador\n" +
+                          "Utiliza solo estas capacidades: " + ", ".join(tools))
 
     intake_path = workdir / "spec/00_intake.yaml"
     intake = intake_path.read_text(encoding="utf-8") if intake_path.exists() else \
@@ -276,10 +301,16 @@ def main():
         text = providers.complete(system_prompt, user)
     except providers.ProviderError as e:
         print(f"  [agent] error de proveedor: {e}", file=sys.stderr)
+        _archive_call(workdir, node, system_prompt, user, text="",
+                      written=[], skipped=[], returncode=1,
+                      detail=f"ProviderError: {e}")
         return 1
     except Exception as e:  # noqa: BLE001 — reportar limpio, no traceback crudo
         print(f"  [agent] fallo la llamada al modelo: {type(e).__name__}: {e}",
               file=sys.stderr)
+        _archive_call(workdir, node, system_prompt, user, text="",
+                      written=[], skipped=[], returncode=1,
+                      detail=f"{type(e).__name__}: {e}")
         return 1
 
     blocked = BLOCKED_BLOCK.search(text)
@@ -293,6 +324,8 @@ def main():
         print(text[:500], file=sys.stderr)
         return 1
     written, skipped = write_files(workdir, allowed, files)
+    _archive_call(workdir, node, system_prompt, user, text,
+                  written=written, skipped=skipped, returncode=0)
     for w in written:
         print(f"  [agent] escrito {w}", flush=True)
     for rel, why in skipped:
@@ -300,8 +333,32 @@ def main():
     if not written:
         print("  [agent] ningun archivo cayo dentro de los paths permitidos",
               file=sys.stderr)
+        _archive_call(workdir, node, system_prompt, user, text,
+                      written=written, skipped=skipped, returncode=1)
         return 1
     return 0
+
+
+def _archive_call(workdir: Path, node: str, system_prompt: str, user: str,
+                  text: str, *, written: list, skipped: list,
+                  returncode: int = 0) -> None:
+    visit_id = os.environ.get("SDD_VISIT_ID")
+    if not visit_id:
+        return
+    task_id = os.environ.get("SDD_METRICS_TASK") or None
+    usage = providers.last_usage() if returncode == 0 and text else None
+    chronicle.archive_agent_call(
+        str(workdir), visit_id, node, task_id,
+        system_prompt=system_prompt,
+        user_prompt=user,
+        response_text=text,
+        stdout_text="",
+        stderr_text="",
+        returncode=returncode,
+        files_written=written,
+        files_skipped=skipped,
+        token_usage=usage,
+    )
 
 
 if __name__ == "__main__":

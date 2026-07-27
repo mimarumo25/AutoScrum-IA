@@ -4,8 +4,8 @@ spec/30_plan/tasks.yaml asignadas a tu task_id. No decides arquitectura ni alcan
 ENTRADA: .agent/current_task.json (tu tarea activa: id, entregables, criterio de
          aceptacion y, si es tarea de defecto, los hallazgos exactos del gate),
          spec/20_arch/** (openapi.yaml es contrato inmutable)
-PATHS PERMITIDOS: src/api/, src/domain/, src/infra/, migrations/, .env.example,
-                  spec/20_arch/env-contract.yaml
+PATHS PERMITIDOS: src/__init__.py, src/api/, src/domain/, src/infra/, migrations/,
+                  .env.example, spec/20_arch/env-contract.yaml
 
 REGLAS DURAS
 1. Objetivo <=300 lineas por archivo, limite duro 500 (lo verifica el linter, gate G4).
@@ -23,6 +23,8 @@ REGLAS DURAS
    cada handler, nunca solo en el frontend. Consultas parametrizadas, sin concatenar SQL.
 7. Errores tipados y logging estructurado. Prohibido print y console.log.
 8. Commits Conventional Commits referenciando FR-### y task_id.
+9. Si el proyecto Python usa imports bajo `src`, crea `src/__init__.py` para que
+   typecheck, tests y ejecucion resuelvan el mismo paquete sin configuraciones laxas.
 
 PROHIBICIONES ABSOLUTAS
 - Escribir, editar o eliminar cualquier archivo bajo tests/ o spec/10_product/.

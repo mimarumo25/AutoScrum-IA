@@ -61,15 +61,21 @@ def blame(output: str, fallback: str) -> str:
     una prueba roja suele delatar un defecto de produccion, y el router debe
     llevarlo a su dueno, no dejarlo siempre en QA."""
     hits = []
-    for raw in PATH_IN_OUTPUT.findall(output or ""):
-        parts = raw.replace("\\", "/").lstrip("./").split("/")
-        # Los runners imprimen rutas absolutas; se prueba cada sufijo hasta dar
-        # con una que exista en el repo. Asi funciona igual en win y en *nix.
-        for i in range(len(parts)):
-            cand = "/".join(parts[i:])
-            if cand and (wd / cand).is_file():
-                hits.append(cand)
-                break
+    for line in (output or "").splitlines():
+        # pytest-cov lista cada archivo de produccion aunque el fallo sea una
+        # asercion defectuosa de QA. Esas filas no son un traceback y no deben
+        # desviar el defecto al backend.
+        if re.search(r"\s+\d+\s+\d+\s+\d+%\s*$", line):
+            continue
+        for raw in PATH_IN_OUTPUT.findall(line):
+            parts = raw.replace("\\", "/").lstrip("./").split("/")
+            # Los runners imprimen rutas absolutas; se prueba cada sufijo hasta dar
+            # con una que exista en el repo. Asi funciona igual en win y en *nix.
+            for i in range(len(parts)):
+                cand = "/".join(parts[i:])
+                if cand and (wd / cand).is_file():
+                    hits.append(cand)
+                    break
     if not hits:
         return fallback
     non_test = [h for h in hits if not h.startswith(("tests/", "test/"))]

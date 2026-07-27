@@ -72,7 +72,7 @@ class OrchestratorCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def fake_agent(self, rc, detail="", writes=None):
-        def _invoke(node, workdir, cfg, simulate, task):
+        def _invoke(node, workdir, cfg, simulate, task, visit_id=""):
             for rel, body in (writes or {}).items():
                 p = Path(workdir) / rel
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -212,6 +212,47 @@ class TestColaDeTareas(unittest.TestCase):
         self.assertEqual(qa["status"], "pending")
         self.assertEqual(taskqueue.next_runnable(t)["id"], "T-002")
 
+    def test_defectos_encadenados_se_cierran_sin_reactivar_trabajo_obsoleto(self):
+        t = self.tasks()
+        taskqueue.mark_done(t, "T-001")
+        qa = taskqueue.by_id(t, "T-002")
+        findings = [{"file": "src/api/main.py", "line": 1,
+                     "rule": "typecheck-rojo", "evidence": "e"}]
+        parent = taskqueue.make_defect(
+            t, "dev_backend", "G9", findings, qa, 1)
+        child = taskqueue.make_defect(
+            t, "dev_backend", "G9", findings, parent, 2)
+
+        taskqueue.mark_done(t, child["id"])
+
+        self.assertEqual(child["status"], "done")
+        self.assertEqual(parent["status"], "done")
+        self.assertNotIn("blocked_by", parent)
+        self.assertEqual(qa["status"], "pending")
+        self.assertNotIn("blocked_by", qa)
+        self.assertEqual(taskqueue.next_runnable(t)["id"], "T-002")
+
+    def test_reanudar_reconcilia_hijo_integrado_antes_del_checkpoint(self):
+        t = self.tasks()
+        taskqueue.mark_done(t, "T-001")
+        qa = taskqueue.by_id(t, "T-002")
+        findings = [{"file": "src/api/main.py", "line": 1,
+                     "rule": "typecheck-rojo", "evidence": "e"}]
+        parent = taskqueue.make_defect(
+            t, "dev_backend", "G9", findings, qa, 1)
+        child = taskqueue.make_defect(
+            t, "dev_backend", "G9", findings, parent, 2)
+        child["status"] = "done"
+        parent["status"] = "pending"
+        parent.pop("blocked_by", None)
+
+        reconciled = taskqueue.reconcile_completed_defects(t)
+
+        self.assertEqual(reconciled, ["D-001"])
+        self.assertEqual(parent["status"], "done")
+        self.assertEqual(qa["status"], "pending")
+        self.assertEqual(taskqueue.next_runnable(t)["id"], "T-002")
+
     def test_fallo_de_instalacion_se_enruta_al_arquitecto_no_a_qa(self):
         # La corrida real escalo porque `npm ci` fallaba y el defecto sobre
         # package.json iba a QA (que no lo posee), gastando reintentos. Ahora el
@@ -345,6 +386,36 @@ class TestReanudar(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(proc.returncode, 1)
             self.assertIn("no hay corrida que reanudar", proc.stdout)
+
+    def test_resume_escalado_en_dispatch_vuelve_al_scheduler(self):
+        state = {
+            "status": "escalated", "cursor": "parallel_dispatch",
+            "attempts": {"T-003:G9": 3}, "resume_at": "qa",
+            "parallel_batch": None, "parallel_results": {"stale": {}},
+            "worker_task_id": "T-003", "current_task": "T-003",
+        }
+
+        previous = orchestrator.prepare_resume(state)
+
+        self.assertEqual(previous, "escalated")
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["cursor"], "task_loop")
+        self.assertEqual(state["attempts"], {})
+        self.assertIsNone(state["parallel_batch"])
+        self.assertEqual(state["parallel_results"], {})
+        self.assertIsNone(state["current_task"])
+
+    def test_resume_running_rancio_en_dispatch_vuelve_al_scheduler(self):
+        state = {
+            "status": "running", "cursor": "parallel_dispatch",
+            "attempts": {}, "parallel_batch": None,
+            "parallel_results": {}, "current_task": None,
+        }
+
+        previous = orchestrator.prepare_resume(state)
+
+        self.assertEqual(previous, "running")
+        self.assertEqual(state["cursor"], "task_loop")
 
     def test_resume_continua_una_corrida_escalada_sin_perder_commits(self):
         import os as _os

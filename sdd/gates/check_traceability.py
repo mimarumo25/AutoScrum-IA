@@ -26,8 +26,8 @@ if a.mode == "product":
     for s in sorted({x for x in scn if scn.count(x) > 1}):
         out.append(finding("spec/10_product", 0, "id-duplicado", f"{s} repetido"))
 else:
-    tests = "\n".join(f.read_text(errors="replace") for f in (wd / "tests").rglob("*")
-                      if f.is_file())
+    test_files = [f for f in (wd / "tests").rglob("*") if f.is_file()]
+    tests = "\n".join(f.read_text(errors="replace") for f in test_files)
     for f in features:
         for i, line in enumerate(f.read_text().splitlines(), 1):
             tags = re.findall(r"@(SCN-\d{3}|critical)", line)
@@ -35,4 +35,15 @@ else:
             norm = re.sub(r"[-_]", "", tests)
             if ids and "critical" in tags and re.sub(r"[-_]", "", ids[0]) not in norm:
                 out.append(finding(f, i, "escenario-critico-sin-prueba", ids[0]))
+    disabled = re.compile(
+        r"(?:pytest\.mark\.(?:xfail|skip|skipif)|unittest\.(?:skip|skipIf|skipUnless))"
+    )
+    for test_file in test_files:
+        for line_no, line in enumerate(
+                test_file.read_text(errors="replace").splitlines(), 1):
+            if disabled.search(line):
+                out.append(finding(
+                    test_file, line_no, "prueba-desactivada",
+                    "QA no puede ocultar fallos con skip/skipif/xfail; debe corregir "
+                    "el producto o mantener la suite roja"))
 emit(out)

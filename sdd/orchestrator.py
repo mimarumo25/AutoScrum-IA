@@ -37,6 +37,8 @@ import graph_runtime  # noqa: E402
 import metrics  # noqa: E402
 import plan_analysis  # noqa: E402
 import process_control  # noqa: E402
+import lifecycle  # noqa: E402
+import chronicle  # noqa: E402
 import run_lease  # noqa: E402
 from run_lease import RunBusyError  # noqa: E402
 from execution_journal import invoke_once  # noqa: E402
@@ -119,6 +121,28 @@ def save(state, path):
                    bytes=path.stat().st_size)
 
 
+def prepare_resume(state):
+    """Normaliza un checkpoint terminal para que vuelva al scheduler.
+
+    LangGraph puede terminar un worker escalado dejando el cursor proyectado en
+    ``parallel_dispatch`` aunque ya no exista un batch ejecutable. Reanudar ese
+    cursor produce un grafo sin ``Send`` y deja el estado falsamente ``running``.
+    Tras una escalada se vuelve al scheduler, que reconstruye un batch seguro a
+    partir de las tareas pendientes y del HEAD integrado.
+    """
+    previous = state.get("status")
+    state["status"] = "running"
+    state["attempts"] = {}
+    state["resume_at"] = None
+    if state.get("cursor") in {"parallel_dispatch", "parallel_collect"}:
+        state["cursor"] = LOOP
+        state["parallel_batch"] = None
+        state["parallel_results"] = {}
+        state["worker_task_id"] = None
+        state["current_task"] = None
+    return previous
+
+
 def git(workdir, *args):
     return process_control.run_git(workdir, *args, text=True)
 
@@ -191,8 +215,8 @@ def commit(workdir, message, allowed):
 
 # --- Ejecucion de un nodo agente -------------------------------------------
 
-def invoke_agent(node, workdir, cfg, simulate, task):
-    """Devuelve (returncode, detalle). rc 3 = el agente se declara bloqueado."""
+def invoke_agent(node, workdir, cfg, simulate, task, visit_id=""):
+    """Devuelve (returncode, detalle, stdout_text, stderr_text). rc 3 = el agente se declara bloqueado."""
     if node.get("type") == "human":
         return 0, "human"
     template = cfg["runtime"]["simulate_cmd" if simulate else "agent_cmd"]
@@ -204,7 +228,8 @@ def invoke_agent(node, workdir, cfg, simulate, task):
     env.update(SDD_METRICS_WORKDIR=str(workdir),
                SDD_METRICS_OPERATION="agent_llm",
                SDD_METRICS_NODE=str(node["id"]),
-               SDD_METRICS_TASK=task_id)
+               SDD_METRICS_TASK=task_id,
+               SDD_VISIT_ID=visit_id)
     started = time.perf_counter()
     proc, timed_out = process_control.run_bounded(
         shlex.split(cmd), cwd=workdir, env=env,
@@ -214,8 +239,18 @@ def invoke_agent(node, workdir, cfg, simulate, task):
                    node=node["id"], task=task_id,
                    simulate=bool(simulate), returncode=proc.returncode,
                    timed_out=timed_out)
-    err = (proc.stderr or ("agente excedio el tiempo configurado" if timed_out else
-                           proc.stdout) or "").strip().replace("\n", " ")
+    stdout_text = (proc.stdout or "").strip()
+    stderr_text = (proc.stderr or "").strip()
+    err = (stderr_text or ("agente excedio el tiempo configurado" if timed_out else
+                           stdout_text) or "").strip().replace("\n", " ")
+    if visit_id:
+        chronicle.archive_agent_call(
+            workdir, visit_id, node["id"], task_id or None,
+            system_prompt="", user_prompt="", response_text="",
+            stdout_text=stdout_text, stderr_text=stderr_text,
+            returncode=proc.returncode,
+            files_written=[], files_skipped=[],
+        )
     return proc.returncode, err[-220:]
 
 
@@ -260,6 +295,7 @@ def enter_task_loop(state, workdir, log_fn):
 
     state["current_task"] = task["id"]
     taskqueue.publish_current(workdir, task)
+    lifecycle.started(workdir, task["id"], task["node"])
     done, total = taskqueue.progress(state["tasks"])
     log_fn(state, "TAREA", id=task["id"], nodo=task["node"],
            avance=f"{done}/{total}", titulo=task["title"][:60])
@@ -288,8 +324,15 @@ def handle_defect(state, workdir, node, task, owner, gate_id, findings, budget, 
 
     key = f"{task['id']}:{gate_id}" if task else f"{owner}:{gate_id}"
     state["attempts"][key] = state["attempts"].get(key, 0) + 1
+    if task:
+        lifecycle.retried(workdir, task["id"], gate_id,
+                          state["attempts"][key],
+                          budget["max_retries_per_gate"])
     if state["attempts"][key] > budget["max_retries_per_gate"]:
         state["status"] = "escalated"
+        if task:
+            lifecycle.escalated(workdir, task["id"],
+                                f"{key} fallo {state['attempts'][key]} veces")
         log_fn(state, "ESCALATE_HUMAN",
                motivo=f"{key} fallo {state['attempts'][key]} veces")
         return
@@ -314,7 +357,9 @@ def handle_defect(state, workdir, node, task, owner, gate_id, findings, budget, 
         return
     state["defect_seq"] += 1
     defect = taskqueue.make_defect(state["tasks"], owner, gate_id, findings,
-                                   task, state["defect_seq"])
+                                    task, state["defect_seq"], workdir)
+    if task:
+        lifecycle.blocked(workdir, task["id"], defect["id"], gate_id, findings)
     log_fn(state, "DEFECTO_TAREA", id=defect["id"], para=owner,
            bloquea=task["id"], gate=gate_id)
     state["cursor"] = LOOP
@@ -328,7 +373,7 @@ def approve(state, workdir, node, task, log_fn):
            accion="commit" if changed else "sin-commit",
            detalle=detail if not changed else task["id"] if task else node["id"])
     if task is not None:
-        taskqueue.mark_done(state["tasks"], task["id"])
+        taskqueue.mark_done(state["tasks"], task["id"], workdir)
         state["current_task"] = None
         taskqueue.clear_current(workdir)
         state["cursor"] = LOOP
@@ -381,7 +426,8 @@ def step(state, args, cfg, nodes, auto_human):
     rc, detail = invoke_once(
         args.workdir,
         getattr(args, "visit_id", None),
-        lambda: invoke_agent(node, args.workdir, cfg, args.simulate, args.task),
+        lambda: invoke_agent(node, args.workdir, cfg, args.simulate, args.task,
+                             str(getattr(args, "visit_id", ""))),
     )
     log(state, "AGENTE", nodo=node["id"], tarea=task["id"] if task else "-",
         resultado="human" if detail == "human" else f"exit={rc}"
@@ -394,6 +440,15 @@ def step(state, args, cfg, nodes, auto_human):
         reports = run_node_gates(node["id"], args.workdir, cfg)
         for r in reports:
             log(state, "GATE " + r["gate_id"], estado=r["status"], hallazgos=len(r["findings"]))
+            if task:
+                lifecycle.gate_result(args.workdir, task["id"],
+                                      r["gate_id"], r["status"] == "pass",
+                                      len(r["findings"]))
+            visit_id = str(getattr(args, "visit_id", ""))
+            if visit_id:
+                chronicle.archive_gate_result(
+                    args.workdir, visit_id, r["gate_id"],
+                    r["status"], r["findings"])
 
     owner, gate_id, findings = route(reports, cfg)
     if owner is None:
@@ -461,10 +516,7 @@ def main():
             print("no hay corrida que reanudar en este proyecto; inicia una nueva.",
                   flush=True)
             return 1
-        prev = state["status"]
-        state["status"] = "running"
-        state["attempts"] = {}
-        state["resume_at"] = None
+        prev = prepare_resume(state)
         # Si el checkpoint esta en interrupt(), graph_runtime envia Command.resume
         # para que la firma humana quede dentro del historial durable del grafo.
         log(state, "REANUDADO", desde=state.get("cursor"), estado_previo=prev)

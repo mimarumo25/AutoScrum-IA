@@ -9,6 +9,7 @@ import unittest
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
@@ -17,6 +18,7 @@ from execution_journal import invoke_once  # noqa: E402
 from graph_runtime import _delta, _merge_results  # noqa: E402
 import cli  # noqa: E402
 import metrics  # noqa: E402
+import parallel_tasks  # noqa: E402
 import task_worktrees  # noqa: E402
 
 PY = sys.executable
@@ -111,6 +113,31 @@ class TestSafeBatch(unittest.TestCase):
         tasks = [{"id": f"T-{index}", "kind": "plan",
                   "deliverables": [f"src/{index}.py"]} for index in range(5)]
         self.assertEqual(len(task_worktrees.safe_batch(tasks, {}, 6)), 5)
+
+
+class TestParallelDefectBudget(unittest.TestCase):
+    def test_colector_respeta_tope_global_de_defectos(self):
+        events = []
+        runner = parallel_tasks.ParallelTasks(
+            ".", None, {"budget": {"max_defect_tasks": 2}}, {}, False,
+            None, lambda _state, event, **fields: events.append((event, fields)),
+            None, lambda value: value, None)
+        task = {"id": "T-1", "node": "qa", "status": "pending",
+                "workspace": {"path": "unused"}}
+        state = {"tasks": [task], "defect_seq": 2, "agent_calls": 0,
+                 "history": [], "attempts": {}, "status": "running"}
+        result = {"task_id": "T-1", "task": task, "outcome": "blocked",
+                  "defect": {"node": "dev_backend", "gate_id": "G9",
+                              "findings": []},
+                  "agent_calls": 0, "history": [], "attempts": {}}
+
+        with patch.object(task_worktrees, "cleanup") as cleanup:
+            keep_running = runner._collect_one(state, result)
+
+        self.assertFalse(keep_running)
+        self.assertEqual(state["status"], "escalated")
+        self.assertIn("tope de tareas de defecto alcanzado", events[-1][1]["motivo"])
+        cleanup.assert_called_once_with(".", task)
 
 
 class TestWorktreeRecovery(unittest.TestCase):

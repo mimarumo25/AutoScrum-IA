@@ -11,13 +11,28 @@ SEGURIDAD: config.json puede contener API keys en claro. Esta en .gitignore.
 """
 import json
 import re
+import tomllib
 from pathlib import Path
 
 PKG = Path(__file__).resolve().parent      # el paquete sdd/
 ROOT = PKG.parent                          # la raiz del repo
 CONFIG_PATH = ROOT / "config.json"
+PIPELINE_PATH = PKG / "pipeline.toml"
 
 AGENT_NODES = ["product", "architect", "planner", "dev_backend", "dev_frontend", "qa"]
+AGENT_ROLES = {
+    "product": "Product Strategist", "architect": "Solution Architect",
+    "planner": "Delivery Planner", "dev_backend": "Backend Engineer",
+    "dev_frontend": "Frontend Engineer", "qa": "Quality Engineer",
+}
+AGENT_TOOLS = {
+    "product": ["spec.read", "spec.write"],
+    "architect": ["spec.read", "spec.write", "repository.inspect"],
+    "planner": ["spec.read", "tasks.plan"],
+    "dev_backend": ["filesystem", "git", "tests", "gates"],
+    "dev_frontend": ["filesystem", "git", "tests", "gates"],
+    "qa": ["filesystem", "tests", "gates", "traceability"],
+}
 
 # .gitignore que se siembra en todo repo objetivo. Desde que el gate G9 EJECUTA la
 # suite, el arbol se llena de artefactos de ejecucion (__pycache__, coverage,
@@ -43,6 +58,8 @@ DEFAULTS = {
     "model": "",
     "keys": {},           # {proveedor: api_key}
     "agent_addons": {},   # {nodo: texto extra para su system prompt}
+    "agent_profiles": {}, # parametros por agente, persistidos localmente
+    "custom_agents": [],  # agentes disponibles para asignacion manual/futura
 }
 
 
@@ -59,6 +76,10 @@ def load() -> dict:
         cfg["keys"] = {}
     if not isinstance(cfg.get("agent_addons"), dict):
         cfg["agent_addons"] = {}
+    if not isinstance(cfg.get("agent_profiles"), dict):
+        cfg["agent_profiles"] = {}
+    if not isinstance(cfg.get("custom_agents"), list):
+        cfg["custom_agents"] = []
     return cfg
 
 
@@ -73,6 +94,30 @@ def save(patch: dict) -> dict:
     if isinstance(patch.get("agent_addons"), dict):
         for node, txt in patch["agent_addons"].items():
             cfg["agent_addons"][node] = txt   # cadena vacia SÍ borra (es intencional)
+    if isinstance(patch.get("agent_profiles"), dict):
+        for node, profile in patch["agent_profiles"].items():
+            if not isinstance(profile, dict):
+                continue
+            clean = dict(profile)
+            clean["enabled"] = bool(profile.get("enabled", True))
+            try:
+                clean["temperature"] = max(0.0, min(2.0, float(profile.get("temperature", 0.2))))
+            except (TypeError, ValueError):
+                clean["temperature"] = 0.2
+            try:
+                clean["max_tokens"] = max(0, min(200000, int(profile.get("max_tokens", 0))))
+            except (TypeError, ValueError):
+                clean["max_tokens"] = 0
+            clean["tools"] = [str(t) for t in profile.get("tools", []) if str(t).strip()]
+            clean["prompt_addon"] = str(profile.get("prompt_addon", ""))
+            node_id = slug(str(node))
+            cfg["agent_profiles"][node_id] = clean
+            cfg["agent_addons"][node_id] = clean["prompt_addon"]
+    if isinstance(patch.get("custom_agents"), list):
+        cfg["custom_agents"] = [
+            dict(agent) for agent in patch["custom_agents"]
+            if isinstance(agent, dict) and slug(str(agent.get("id", ""))) not in AGENT_NODES
+        ]
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     # Las API keys van en claro (cifrarlas exigiria un llavero del SO y una
     # dependencia nueva; queda fuera de v0). Mitigacion: el archivo esta en
@@ -85,6 +130,56 @@ def save(patch: dict) -> dict:
             pass
     return cfg
 
+
+def agent_profile(node_id: str) -> dict:
+    """Perfil efectivo de un agente, con defaults seguros y retrocompatibles."""
+    cfg = load()
+    stored = cfg.get("agent_profiles", {}).get(node_id, {})
+    profile = {
+        "enabled": True, "provider": "", "model": "", "temperature": 0.2,
+        "max_tokens": 0, "tools": list(AGENT_TOOLS.get(node_id, ["filesystem"])),
+        "prompt_addon": cfg.get("agent_addons", {}).get(node_id, ""),
+    }
+    if isinstance(stored, dict):
+        profile.update(stored)
+    return profile
+
+
+def agent_catalog() -> list[dict]:
+    """Catalogo para la UI, combinando nodos del pipeline y perfiles locales."""
+    try:
+        pipeline = tomllib.loads(PIPELINE_PATH.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        pipeline = {"node": []}
+    result = []
+    for node in pipeline.get("node", []):
+        node_id = str(node.get("id", ""))
+        if not node_id or node.get("type") == "human":
+            continue
+        prompt_path = PKG / str(node.get("prompt", ""))
+        try:
+            prompt_base = prompt_path.read_text(encoding="utf-8")
+        except OSError:
+            prompt_base = ""
+        result.append({
+            "id": node_id, "name": AGENT_ROLES.get(node_id, node_id.replace("_", " ").title()),
+            "role": AGENT_ROLES.get(node_id, "Custom agent"), "built_in": True,
+            "prompt_path": str(node.get("prompt", "")), "prompt_base": prompt_base,
+            "writes": node.get("writes", []), "must_produce": node.get("must_produce", []),
+            "gates": node.get("gates", []), "task_node": bool(node.get("task_node")),
+            "next": node.get("next", ""), **agent_profile(node_id),
+        })
+    for custom in load().get("custom_agents", []):
+        node_id = slug(str(custom.get("id", "")))
+        result.append({
+            "id": node_id, "name": custom.get("name") or node_id.replace("_", " ").title(),
+            "role": custom.get("role") or "Custom agent", "built_in": False,
+            "prompt_path": "", "prompt_base": custom.get("prompt_base", ""),
+            "writes": custom.get("writes", []), "must_produce": [],
+            "gates": custom.get("gates", []), "task_node": True, "next": "task_loop",
+            **agent_profile(node_id),
+        })
+    return result
 
 def slug(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_.-]+", "-", (name or "").strip())

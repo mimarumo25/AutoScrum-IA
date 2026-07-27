@@ -27,6 +27,8 @@ import task_worktrees
 import metrics
 import process_control
 import run_lease
+import lifecycle
+import chronicle
 
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "SDD_API_KEY"}
 KEY_ENV.update({p: c["key_env"] for p, c in providers.OPENAI_PRESETS.items()})
@@ -358,6 +360,213 @@ def _print_review_backlog(wd):
         print(f"        {C.gray('· ' + nodo + ': ' + nota)}")
 
 
+def tasks(a):
+    wd = Path(a.workdir)
+    if a.task_id:
+        _show_task_lifecycle(wd, a.task_id)
+        return 0
+    _list_task_summaries(wd, getattr(a, "verbose", False))
+    return 0
+
+
+def _list_task_summaries(wd, verbose):
+    all_tasks = lifecycle.all_tasks(wd)
+    if not all_tasks:
+        print(f"{C.gray('no hay tareas registradas en')} {wd / '.agent/tasks/'}")
+        return
+    print(C.bold(f"\nTAREAS REGISTRADAS ({len(all_tasks)})"))
+    print(C.gray("─" * 68))
+    for t in sorted(all_tasks, key=lambda x: str(x.get("created_at", "")) or ""):
+        tid = str(t.get("task_id", "?"))
+        detail = lifecycle.summary(wd, tid)
+        status = detail.get("status", "?")
+        node = detail.get("node", "?")
+        kind = detail.get("kind", "?")
+        calls = detail.get("calls", 0)
+        gates = detail.get("gates", {})
+        gate_str = " ".join(
+            (C.green if passed else C.red)(f"{g}{'✓' if passed else '✗'}")
+            for g, passed in sorted(gates.items()))
+        color_fn = {"done": C.green, "blocked": C.yellow, "escalated": C.red}.get(status, C.bold)
+        status_str = color_fn(status)
+        print(f"  {C.cyan(tid):<10} {status_str:<10} {C.gray(node):<14} "
+              f"{C.gray(kind):<6} llamadas={calls:<2} {gate_str}")
+        if verbose:
+            events = lifecycle.read(wd, tid)
+            for ev in events:
+                ts = ev.get("t", "")[-8:]
+                name = ev.get("event", "?")
+                extra = ""
+                if name == "gate_result":
+                    extra = f"{ev.get('gate')} {'pass' if ev.get('status') == 'pass' else 'fail'}"
+                elif name == "blocked":
+                    extra = f"por {ev.get('blocked_by')} ({ev.get('gate')})"
+                elif name == "integrated":
+                    extra = f"{ev.get('result')} - {ev.get('detail', '')[:60]}"
+                elif name == "escalated":
+                    extra = str(ev.get("reason", ""))[:60]
+                elif name == "retried":
+                    extra = f"{ev.get('gate')} intento {ev.get('attempt')}"
+                print(f"    {C.gray(ts)} {C.bold(name):<14} {C.gray(extra)}")
+    print()
+
+
+def chronicle_cmd(a):
+    wd = Path(a.workdir)
+    if a.visit_id:
+        _show_visit_detail(wd, a.visit_id, getattr(a, "full", False))
+        return 0
+    _list_chronicle_visits(wd, a.recent or 20)
+    return 0
+
+
+def _list_chronicle_visits(wd, recent):
+    visits = chronicle.all_visits(wd)[:recent]
+    if not visits:
+        print(f"{C.gray('no hay visitas archivadas en')} {wd / chronicle.CHRONICLE_ROOT}")
+        return
+    print(C.bold(f"\nCHRONICLE DE AGENTE — {(wd / chronicle.CHRONICLE_ROOT)}"))
+    print(C.gray("─" * 80))
+    for v in visits:
+        vid = str(v.get("visit_id", "?"))
+        node = str(v.get("node", "?"))
+        task = str(v.get("task_id") or "-")
+        rc = v.get("returncode", "?")
+        at = str(v.get("at", "")[:19])
+        prompt_kb = int(v.get("prompt_chars", 0)) // 1024
+        resp_kb = int(v.get("response_chars", 0)) // 1024
+        status = C.green("OK") if rc == 0 else C.red(f"exit={rc}")
+        print(f"  {C.cyan(at)} {status}  {C.bold(node):<14} "
+              f"tarea={C.gray(task):<10} "
+              f"prompt={prompt_kb}KB resp={resp_kb}KB  "
+              f"{C.gray(vid[:12])}")
+    if len(visits) >= recent:
+        print(C.gray(f"  ... y mas. Usa --recent N o --visit-id <id> para ver detalles"))
+    print()
+
+
+def _show_visit_detail(wd, visit_id, full=False):
+    v = chronicle.read_visit(wd, visit_id)
+    if not v:
+        print(f"{C.gray('visita no encontrada:')} {visit_id}")
+        return
+    print(C.bold(f"\nCHRONICLE — {visit_id}"))
+    print(f"  nodo: {C.cyan(v.get('node', '?'))}  "
+          f"tarea: {C.gray(v.get('task_id') or '-')}  "
+          f"returncode: {C.green('0') if v.get('returncode') == 0 else C.red(str(v.get('returncode', '?')))}")
+    prompt_kb = int(v.get("prompt_chars", 0)) // 1024
+    resp_kb = int(v.get("response_chars", 0)) // 1024
+    print(f"  prompt: {prompt_kb}KB  respuesta: {resp_kb}KB")
+    tokens = v.get("token_usage")
+    if tokens and tokens.get("calls", 0) > 0:
+        print(f"  tokens: {tokens['input_tokens']} in + {tokens['output_tokens']} out "
+              f"({tokens['calls']} llamadas)")
+
+    files = v.get("files_written", {})
+    if isinstance(files, dict):
+        written = files.get("written", [])
+        skipped = files.get("skipped", [])
+        if written:
+            print(C.bold("  archivos escritos:"))
+            for f in written:
+                print(f"    {C.green('+')} {f}")
+        if skipped:
+            print(C.bold("  archivos omitidos:"))
+            for s in skipped:
+                path = s.get("path", "?")
+                reason = s.get("reason", "?")
+                print(f"    {C.yellow('!')} {path} — {C.gray(reason)}")
+
+    if full:
+        sys_prompt = v.get("system_prompt", "")
+        user_prompt = v.get("user_prompt", "")
+        response = v.get("response", "")
+        agent_stdout = v.get("agent_stdout", "")
+        agent_stderr = v.get("agent_stderr", "")
+
+        if sys_prompt:
+            print(C.bold(f"\n  -- SYSTEM PROMPT ({len(sys_prompt)} chars) --"))
+            print(C.gray(sys_prompt[:3000]))
+        if user_prompt:
+            print(C.bold(f"\n  -- USER PROMPT ({len(user_prompt)} chars) --"))
+            print(C.gray(user_prompt[:3000]))
+        if response:
+            print(C.bold(f"\n  -- RESPUESTA LLM ({len(response)} chars) --"))
+            print(C.gray(response[:5000]))
+        if agent_stdout:
+            print(C.bold(f"\n  -- STDOUT ({len(agent_stdout)} chars) --"))
+            print(C.gray(agent_stdout[:2000]))
+        if agent_stderr:
+            print(C.bold(f"\n  -- STDERR ({len(agent_stderr)} chars) --"))
+            print(C.gray(agent_stderr[:2000]))
+    else:
+        print(C.gray("  usa --full para ver los prompts y la respuesta completa del LLM"))
+    print()
+
+
+def _show_task_lifecycle(wd, task_id):
+    events = lifecycle.read(wd, task_id)
+    if not events:
+        print(f"{C.gray('no hay registro para la tarea')} {C.cyan(task_id)}")
+        return
+    summary = lifecycle.summary(wd, task_id)
+    print(C.bold(f"\nCICLO DE VIDA — {task_id}"))
+    print(f"  estado final: {C.cyan(summary.get('status', '?'))}")
+    print(f"  nodo: {C.gray(summary.get('node', '?'))} "
+          f"· kind: {C.gray(summary.get('kind', '?'))}")
+    print(f"  eventos: {summary.get('events', 0)} · "
+          f"llamadas a agente: {summary.get('calls', 0)}")
+    if summary.get("blocked_by"):
+        print(f"  bloqueada por: {C.yellow(summary.get('blocked_by'))}")
+
+    gates = summary.get("gates", {})
+    if gates:
+        print(C.bold("  gates:"))
+        gate_str = " ".join(
+            (C.green if passed else C.red)(f"{g}{'✓' if passed else '✗'}")
+            for g, passed in sorted(gates.items()))
+        print(f"    {gate_str}")
+
+    tokens = lifecycle.total_token_usage_by_task(wd, task_id)
+    if tokens.get("calls", 0) > 0:
+        print(f"  tokens: {tokens['input_tokens']} entrada + "
+              f"{tokens['output_tokens']} salida ({tokens['calls']} llamadas)")
+
+    print(C.gray("\n  ── timeline ──"))
+    for ev in events:
+        ts = ev.get("t", "")
+        name = ev.get("event", "?")
+        icon = {
+            "created": "📋", "started": "▶", "agent_called": "🤖",
+            "gate_result": "🔍", "blocked": "🚫", "retried": "🔄",
+            "escalated": "⚠", "integrated": "✅", "done": "🏁",
+        }.get(name, "·")
+        extra = ""
+        if name == "gate_result":
+            extra = f"{ev.get('gate')} → {'PASS' if ev.get('status') == 'pass' else 'FAIL'} ({ev.get('findings', 0)} hallazgos)"
+        elif name == "blocked":
+            extra = f"bloqueada por {ev.get('blocked_by')} — gate {ev.get('gate')}"
+            findings = ev.get("findings", [])
+            for f in findings:
+                extra += f"\n      {C.red('  ✗')} {f.get('rule')} {C.gray(f.get('file') + ':' + str(f.get('line',''))) if f.get('file') else ''}"
+        elif name == "integrated":
+            extra = f"resultado: {ev.get('result')} — {ev.get('detail', '')[:80]}"
+        elif name == "escalated":
+            extra = str(ev.get("reason", ""))[:100]
+        elif name == "retried":
+            extra = f"{ev.get('gate')} — intento {ev.get('attempt')}/{ev.get('max_retries')}"
+        elif name == "agent_called":
+            extra = f"returncode={ev.get('returncode')} status={ev.get('status')}"
+        elif name == "started":
+            extra = f"nodo={ev.get('node')} workspace={str(ev.get('workspace', ''))[:40]}"
+        print(f"  {C.gray(ts)} {icon} {C.bold(name):<14} {C.gray(extra)}")
+
+    if tokens.get("calls", 0) > 0:
+        print(C.gray(f"\n  tokens: {tokens['input_tokens']} entrada + "
+                      f"{tokens['output_tokens']} salida ({tokens['calls']} llamadas)"))
+    print()
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="sdd", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -393,11 +602,23 @@ def build_parser():
     s = sub.add_parser("view"); s.add_argument("--workdir", default="../demo-repo")
     s.add_argument("--no-open", action="store_true", help="solo genera el HTML, no abre el navegador")
     s.set_defaults(fn=view)
+    s = sub.add_parser("tasks")
+    s.add_argument("--workdir", default="../demo-repo")
+    s.add_argument("--task-id", default=None, help="id de tarea especifica (si no, lista todas)")
+    s.add_argument("--verbose", action="store_true", help="muestra eventos detallados de cada tarea")
+    s.set_defaults(fn=tasks)
+    s = sub.add_parser("chronicle")
+    s.add_argument("--workdir", default="../demo-repo")
+    s.add_argument("--visit-id", default=None, help="id de visita especifica")
+    s.add_argument("--recent", type=int, default=20, help="cuantas visitas recientes mostrar")
+    s.add_argument("--full", action="store_true", help="muestra prompts y respuesta completa del LLM")
+    s.set_defaults(fn=chronicle_cmd)
     return p
 
 
 SHELL_CMDS = ("demo", "gates", "run", "resume", "clean", "test",
-              "web", "serve", "doctor", "config", "show", "view")
+              "web", "serve", "doctor", "config", "show", "view", "tasks",
+              "chronicle")
 
 
 def _shell_help(parser):

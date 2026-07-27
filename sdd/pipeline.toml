@@ -95,7 +95,7 @@ next = "task_loop"
 id = "dev_backend"
 prompt = "agents/dev_backend.md"
 task_node = true
-writes = ["src/api/", "src/domain/", "src/infra/", "migrations/", ".env.example", "spec/20_arch/env-contract.yaml"]
+writes = ["src/__init__.py", "src/api/", "src/domain/", "src/infra/", "migrations/", ".env.example", "spec/20_arch/env-contract.yaml"]
 gates = ["G7", "G0", "G4", "G5", "G6", "R2"]
 next = "task_loop"
 

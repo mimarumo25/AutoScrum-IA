@@ -20,6 +20,8 @@ from pathlib import Path
 
 import yaml
 
+import lifecycle
+
 PLAN_PATH = "spec/30_plan/tasks.yaml"
 CURRENT_PATH = ".agent/current_task.json"
 
@@ -40,7 +42,7 @@ def load_plan(workdir) -> list:
     raw = doc.get("tasks") if isinstance(doc, dict) else None
     if not isinstance(raw, list) or not raw:
         raise PlanError(f"{PLAN_PATH} no contiene una lista 'tasks' no vacia")
-    return [{
+    result = [{
         "id": str(t.get("id")),
         "title": str(t.get("title") or t.get("id")),
         "node": str(t.get("node")),
@@ -52,6 +54,9 @@ def load_plan(workdir) -> list:
         "kind": "plan",
         "status": "pending",
     } for t in raw if isinstance(t, dict)]
+    for task in result:
+        lifecycle.created(workdir, task)
+    return result
 
 
 def by_id(tasks, tid):
@@ -85,19 +90,52 @@ def progress(tasks):
     return sum(1 for t in tasks if t["status"] == "done"), len(tasks)
 
 
-def mark_done(tasks, tid):
-    """Cierra una tarea y libera a quien esperaba por ella."""
+def mark_done(tasks, tid, workdir=None):
+    """Cierra una tarea y libera a quien esperaba por ella.
+
+    Un defecto puede quedar bloqueado por otro defecto mas especifico. Cuando
+    el hijo termina, volver a ejecutar toda la cadena usa criterios obsoletos y
+    worktrees basados en commits antiguos. Los defectos padres se cierran en
+    cascada; una tarea normal (por ejemplo QA) vuelve a ``pending`` para
+    revalidar el flujo completo sobre el codigo integrado.
+    """
     task = by_id(tasks, tid)
     if task is None:
         return
     task["status"] = "done"
+    if workdir is not None:
+        lifecycle.done(workdir, tid)
     for other in tasks:
         if other.get("blocked_by") == tid:
-            other["status"] = "pending"
             other.pop("blocked_by", None)
+            if other.get("kind") == "defect":
+                mark_done(tasks, other["id"], workdir)
+            else:
+                other["status"] = "pending"
 
 
-def make_defect(tasks, owner, gate_id, findings, blocked_task, seq):
+def reconcile_completed_defects(tasks):
+    """Repara checkpoints antiguos con cadenas de defectos ya resueltas.
+
+    Una corrida puede caer despues de integrar el defecto hijo y antes de que
+    ``mark_done`` persista el cierre del padre. ``raised_by`` conserva esa
+    relacion incluso cuando ``blocked_by`` ya fue retirado. La reconciliacion
+    hace idempotente la reanudacion y devuelve los ids cerrados para poder
+    limpiar sus worktrees obsoletos.
+    """
+    before = {str(task["id"]): task.get("status") for task in tasks}
+    for child in list(tasks):
+        if child.get("kind") != "defect" or child.get("status") != "done":
+            continue
+        parent = by_id(tasks, child.get("raised_by"))
+        if parent is not None and parent.get("kind") == "defect":
+            mark_done(tasks, parent["id"])
+    return [str(task["id"]) for task in tasks
+            if before.get(str(task["id"])) != "done"
+            and task.get("status") == "done"]
+
+
+def make_defect(tasks, owner, gate_id, findings, blocked_task, seq, workdir=None):
     """Convierte un defecto ajeno en trabajo asignado a su dueno.
 
     Si el gate manda el defecto a un nodo distinto del que corrio, reintentar el
@@ -128,6 +166,8 @@ def make_defect(tasks, owner, gate_id, findings, blocked_task, seq):
         "raised_by": blocked_task["id"] if blocked_task else None,
     }
     tasks.append(defect)
+    if workdir is not None:
+        lifecycle.created(workdir, defect)
     if blocked_task is not None:
         blocked_task["status"] = "blocked"
         blocked_task["blocked_by"] = tid

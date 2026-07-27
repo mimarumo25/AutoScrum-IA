@@ -171,6 +171,22 @@ class TestG9Suite(RepoCase):
                f"language: python\ndir: .\ntest: {PYNAME} -m unittest discover -s tests\n")
         self.assertEqual(self._g9(), [])
 
+    def test_tabla_de_cobertura_no_culpa_al_backend_por_asercion_de_qa(self):
+        self.w("src/api/main.py", "def health():\n    return 'ok'\n")
+        self.w("tests/test_ui.py", "def test_ui():\n    assert False\n")
+        self.w("fake_fail.py",
+               "import sys\n"
+               "print('src/api/main.py 21 0 100%')\n"
+               "print('FAILED tests/test_ui.py::test_ui - AssertionError')\n"
+               "sys.exit(1)\n")
+        self.w("spec/20_arch/toolchain.yaml",
+               f"language: python\ndir: .\ntest: {PYNAME} fake_fail.py\n")
+
+        findings = self._g9()
+
+        self.assertEqual(rules(findings), {"suite-roja"})
+        self.assertEqual(findings[0]["file"], "tests/test_ui.py")
+
     def test_coverage_insuficiente_es_detectada(self):
         # El paso coverage es un comando mas; si falla (umbral no alcanzado) se
         # reporta como cobertura-insuficiente. Se usa un script en disco en vez de

@@ -228,6 +228,17 @@ class TestG8ScenarioCoverage(GateTestCase):
                                    "--mode", "qa", "--workdir", self.wdp())
         self.assertEqual((rc, findings), (0, []))
 
+    def test_xfail_no_puede_ocultar_un_escenario_rojo(self):
+        write(self.wd, "spec/10_product/features/f.feature",
+              "@FR-001 @SCN-001 @critical\nEscenario: a\n")
+        write(self.wd, "tests/test_scn.py",
+              "import pytest\n\n@pytest.mark.xfail(reason='bug')\n"
+              "def test_SCN_001(): assert False\n")
+        findings, rc = run_checker("check_traceability.py",
+                                   "--mode", "qa", "--workdir", self.wdp())
+        self.assertEqual(rc, 1)
+        self.assertIn("prueba-desactivada", rules(findings))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -22,6 +23,8 @@ import providers  # noqa: E402
 import report  # noqa: E402
 import process_control  # noqa: E402
 import tomllib  # noqa: E402
+import lifecycle  # noqa: E402
+import chronicle  # noqa: E402
 from webpage import PAGE  # noqa: E402  plantilla HTML del panel (modulo aparte)
 
 ROOT = Path(__file__).resolve().parent
@@ -164,40 +167,140 @@ def _sprint_from(state_path: Path):
              "blocked_by": t.get("blocked_by")} for t in (st.get("tasks") or [])]
 
 
+def _artifact_list(workdir: Path) -> list[dict]:
+    """Artefactos recientes, sin exponer archivos internos ni secretos."""
+    if not workdir.exists():
+        return []
+    result = []
+    for root in (workdir / "spec", workdir / "src", workdir / "tests"):
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.stat().st_size > 512_000:
+                continue
+            result.append({"path": path.relative_to(workdir).as_posix(),
+                           "size": path.stat().st_size, "updated": path.stat().st_mtime})
+    return sorted(result, key=lambda item: item["updated"], reverse=True)[:40]
+
+
+def _runtime_agents(steps, sprint, run_status, task_summaries=None):
+    """Proyecta pasos y journals concurrentes en microestados visuales."""
+    current = steps[-1] if steps else None
+    completed = {step.get("node") for step in steps if step.get("commit")}
+    summaries = task_summaries or []
+    out = []
+    for agent in config.agent_catalog():
+        node_id = agent["id"]
+        tasks = [task for task in sprint if task.get("node") == node_id]
+        node_runs = [item for item in summaries if item.get("node") == node_id]
+        live_runs = [item for item in node_runs if item.get("status") not in ("done", "blocked", "escalated")]
+        failed_runs = [item for item in node_runs if item.get("status") in ("blocked", "escalated")]
+        state = "idle"
+        if not agent.get("enabled", True):
+            state = "disabled"
+        elif live_runs and run_status == "running":
+            # Antes de agent_called el modelo está razonando; después se ejecutan gates/tools.
+            state = "tool_call" if any(item.get("calls", 0) for item in live_runs) else "thinking"
+        elif failed_runs or tasks and any(t.get("status") in ("blocked", "escalated") for t in tasks):
+            state = "error"
+        elif current and current.get("node") == node_id and run_status == "running":
+            state = "error" if any(not gate[1] for gate in current.get("gates", [])) else "thinking"
+        elif node_id in completed or node_runs and all(item.get("status") == "done" for item in node_runs) or tasks and all(t.get("status") == "done" for t in tasks):
+            state = "completed"
+        elif run_status == "running" and (tasks or node_runs):
+            state = "queued"
+        task_total = max(len(tasks), len(node_runs))
+        task_done = max(sum(t.get("status") == "done" for t in tasks),
+                        sum(item.get("status") == "done" for item in node_runs))
+        active_task = live_runs[-1].get("task_id", "") if live_runs else ""
+        if not active_task and current and current.get("node") == node_id:
+            active_task = current.get("task", "")
+        out.append({"id": node_id, "name": agent.get("name", node_id),
+                    "role": agent.get("role", ""), "state": state,
+                    "enabled": agent.get("enabled", True), "tools": agent.get("tools", []),
+                    "model": agent.get("model", ""), "tasks": task_total,
+                    "tasks_done": task_done, "current_task": active_task,
+                    "active_runs": len(live_runs)})
+    return out
+
+
+def _view_payload(workdir, status, provider, project, task):
+    wd = Path(workdir) if workdir else None
+    steps, nodes, final, sprint, engine, raw_state = [], [], None, [], None, {}
+    if wd:
+        state_path = wd / ".agent/state.json"
+        if state_path.exists():
+            try:
+                raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+                cfg = tomllib.loads((ROOT / "pipeline.toml").read_text(encoding="utf-8"))
+                steps = report.build_steps(raw_state.get("history", []))
+                nodes = [n["id"] for n in cfg["node"]] + ["done"]
+                final, engine = raw_state.get("status"), raw_state.get("engine")
+                sprint = _sprint_from(state_path)
+            except (ValueError, OSError, tomllib.TOMLDecodeError):
+                pass
+    iterations = []
+    for index, step in enumerate(steps):
+        failed = any(not gate[1] for gate in step.get("gates", []))
+        iterations.append({**step, "id": f"iter-{index + 1:02d}", "index": index + 1,
+                           "status": "error" if failed else "completed" if step.get("commit") else "active"})
+    idea = ""
+    if wd and (wd / "spec/00_intake.yaml").exists():
+        idea = (wd / "spec/00_intake.yaml").read_text(encoding="utf-8", errors="replace")
+    try:
+        tokens = report._token_usage(wd) if wd else {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+    except (OSError, ValueError):
+        tokens = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+    task_summaries = []
+    if wd:
+        try:
+            task_summaries = [lifecycle.summary(wd, item["task_id"])
+                              for item in lifecycle.all_tasks(wd)]
+        except (OSError, ValueError, KeyError):
+            task_summaries = []
+    return {"status": status, "final": final, "provider": provider,
+            "project": project, "task": task, "engine": engine,
+            "steps": steps, "iterations": iterations, "nodes": nodes,
+            "sprint": sprint, "agents": _runtime_agents(steps, sprint, status, task_summaries),
+            "live_tasks": task_summaries, "tokens": tokens, "input": idea,
+            "artifacts": _artifact_list(wd) if wd else [], "raw": {
+                "run_id": raw_state.get("run_id"), "agent_calls": raw_state.get("agent_calls", 0),
+                "attempts": raw_state.get("attempts", {}), "started_at": raw_state.get("started_at")}}
+
+
 def _state():
     with _LOCK:
-        snap = dict(RUN); snap["log"] = list(RUN["log"])
-    steps, nodes, final, sprint, engine = [], [], None, [], None
-    if snap["workdir"]:
-        sp = Path(snap["workdir"]) / ".agent/state.json"
-        if sp.exists():
-            steps, nodes, final = _steps_from(sp)
-            sprint = _sprint_from(sp)
-            try:
-                engine = json.loads(sp.read_text(encoding="utf-8")).get("engine")
-            except (ValueError, OSError):
-                pass
-    return {"status": snap["status"], "final": final, "provider": snap["provider"],
-            "project": snap["project"], "task": snap["task"],
-            "engine": engine, "steps": steps, "nodes": nodes,
-            "sprint": sprint, "log": snap["log"]}
+        snap = dict(RUN)
+        snap["log"] = list(RUN["log"])
+    payload = _view_payload(snap["workdir"], snap["status"], snap["provider"],
+                            snap["project"], snap["task"])
+    payload["log"] = snap["log"]
+    return payload
 
 
 def _task_view(project, task):
     wd = config.resolve_output(project, task)
-    sp = wd / ".agent/state.json"
-    if not sp.exists():
-        return {"status": "idle", "final": "sin correr", "provider": None,
-                "project": project, "task": task, "steps": [], "nodes": [], "log": []}
-    steps, nodes, final = _steps_from(sp)
-    try:
-        engine = json.loads(sp.read_text(encoding="utf-8")).get("engine")
-    except (ValueError, OSError):
-        engine = None
-    lf = wd / ".agent/run.log"
-    log = lf.read_text(encoding="utf-8", errors="replace").splitlines() if lf.exists() else []
-    return {"status": "idle", "final": final, "provider": None, "engine": engine,
-            "project": project, "task": task, "steps": steps, "nodes": nodes, "log": log}
+    state_path = wd / ".agent/state.json"
+    if not state_path.exists():
+        payload = _view_payload(wd, "idle", None, project, task)
+        payload["final"] = "sin correr"
+        payload["log"] = []
+        return payload
+    payload = _view_payload(wd, "idle", None, project, task)
+    log_path = wd / ".agent/run.log"
+    payload["log"] = (log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                      if log_path.exists() else [])
+    return payload
+
+class ControlTowerServer(ThreadingHTTPServer):
+    """Silencia desconexiones normales de navegadores con SSE/keep-alive."""
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError,
+                              ConnectionAbortedError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
 
 class H(BaseHTTPRequestHandler):
@@ -216,6 +319,29 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(n) or "{}")
 
+    def _stream_states(self):
+        """SSE de snapshots deduplicados; el cliente reconecta cada minuto."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        previous = None
+        try:
+            for seq in range(120):
+                payload = json.dumps(_state(), ensure_ascii=False, separators=(",", ":"))
+                if payload != previous:
+                    message = f"id: {seq}\nevent: state\ndata: {payload}\n\n".encode("utf-8")
+                    self.wfile.write(message)
+                    self.wfile.flush()
+                    previous = payload
+                elif seq % 20 == 0:
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError):
+            return
+
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
@@ -228,6 +354,7 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/config":
             cfg = config.load()
             cfg["model_choices"] = providers.MODEL_CHOICES
+            cfg["agents"] = config.agent_catalog()
             self._send(200, json.dumps(cfg))
         elif u.path == "/projects":
             self._send(200, json.dumps(config.list_projects()))
@@ -236,6 +363,60 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/task":
             self._send(200, json.dumps(_task_view(q.get("project", [""])[0],
                                                    q.get("task", [""])[0])))
+        elif u.path == "/lifecycle":
+            tid = q.get("task_id", [""])[0]
+            project = q.get("project", [""])[0]
+            task_name = q.get("task", [""])[0]
+            with _LOCK:
+                live_workdir = RUN.get("workdir")
+            wd = config.resolve_output(project, task_name) if project else (
+                Path(live_workdir) if live_workdir else None)
+            if wd is None:
+                self._send(200, json.dumps({"tasks": []}))
+            elif not tid:
+                self._send(200, json.dumps({"tasks": lifecycle.all_tasks(str(wd))}))
+            else:
+                self._send(200, json.dumps({
+                    "summary": lifecycle.summary(str(wd), tid),
+                    "events": lifecycle.read(str(wd), tid),
+                    "tokens": lifecycle.total_token_usage_by_task(str(wd), tid),
+                }))
+        elif u.path == "/chronicle":
+            project = q.get("project", [""])[0]
+            task_name = q.get("task", [""])[0]
+            with _LOCK:
+                live_workdir = RUN.get("workdir")
+            wd = config.resolve_output(project, task_name) if project else (
+                Path(live_workdir) if live_workdir else None)
+            visit_id = q.get("visit_id", [""])[0]
+            try:
+                recent = max(1, min(100, int(q.get("recent", ["20"])[0])))
+            except ValueError:
+                recent = 20
+            if wd is None:
+                self._send(200, json.dumps({"visits": []}))
+            elif visit_id:
+                self._send(200, json.dumps(chronicle.read_visit(str(wd), visit_id)))
+            else:
+                self._send(200, json.dumps({"visits": chronicle.all_visits(str(wd))[:recent]}))
+        elif u.path == "/artifact":
+            project = q.get("project", [""])[0]
+            task_name = q.get("task", [""])[0]
+            rel = q.get("path", [""])[0]
+            wd = config.resolve_output(project, task_name)
+            target = (wd / rel).resolve()
+            try:
+                target.relative_to(wd)
+            except ValueError:
+                self._send(403, "fuera del proyecto", "text/plain; charset=utf-8")
+                return
+            if not target.is_file() or target.stat().st_size > 512_000:
+                self._send(404, "no disponible", "text/plain; charset=utf-8")
+                return
+            self._send(200, target.read_text(encoding="utf-8", errors="replace"),
+                       "text/plain; charset=utf-8")
+        elif u.path == "/events":
+            self._stream_states()
         elif u.path == "/state":
             self._send(200, json.dumps(_state()))
         else:
@@ -268,7 +449,7 @@ class H(BaseHTTPRequestHandler):
 
 
 def serve(host="127.0.0.1", port=8770):
-    httpd = ThreadingHTTPServer((host, port), H)
+    httpd = ControlTowerServer((host, port), H)
     print(f"panel SDD en http://{host}:{port}  (Ctrl+C para salir)")
     try:
         httpd.serve_forever()
@@ -277,4 +458,4 @@ def serve(host="127.0.0.1", port=8770):
 
 
 if __name__ == "__main__":
-    serve()
+    serve(port=int(os.environ.get("SDD_PORT", "8770")))
