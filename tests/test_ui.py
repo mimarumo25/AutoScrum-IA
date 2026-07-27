@@ -96,6 +96,13 @@ class TestServer(unittest.TestCase):
         self.assertIn("data-tab=tasks", server.PAGE)
         self.assertIn("paintSprint", server.PAGE, "el panel debe renderizar el sprint")
 
+    def test_page_permite_copiar_todo_el_registro(self):
+        self.assertIn("id=copylog", server.PAGE)
+        self.assertIn('aria-label="Copiar todo el registro"', server.PAGE)
+        self.assertIn('LOG_LINES.join("\\n")', server.PAGE)
+        self.assertIn("navigator.clipboard.writeText", server.PAGE)
+        self.assertIn('document.execCommand("copy")', server.PAGE)
+
     def test_sprint_from_extrae_tareas_del_estado(self):
         with tempfile.TemporaryDirectory() as tmp:
             sp = Path(tmp) / "state.json"

@@ -128,6 +128,12 @@ select{appearance:none;cursor:pointer}
 .node.fail .ring{border-color:var(--bad);background:var(--bad)}.node.fail .ring svg{stroke:#450a0a}
 .conn.on{background:var(--ac)}
 .viewbar{font-size:12px;color:var(--fg3);padding:0 18px 6px;font-family:ui-monospace,Consolas,monospace}
+.loghead{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--bd);padding-right:12px}
+.loghead h2{border-bottom:0;flex:1}
+.copylog{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--bd);color:var(--fg2);
+ border-radius:7px;padding:6px 9px;font:500 11px/1 system-ui;cursor:pointer;transition:border-color .15s,color .15s}
+.copylog:hover:not(:disabled){border-color:var(--ac);color:var(--fg)}.copylog:disabled{opacity:.45;cursor:not-allowed}
+.copylog svg{width:14px;height:14px;stroke:currentColor}
 .logcard .log{background:#0a0f1c;border-radius:0 0 12px 12px;font-family:ui-monospace,Consolas,monospace;
  font-size:12px;line-height:1.65;padding:14px 16px;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#c7d2e0}
 .log .empty{color:#4b5b74}.log .l-err{color:#f87171}.log .l-ok{color:#4ade80}
@@ -218,7 +224,11 @@ select{appearance:none;cursor:pointer}
    <div id=sprint class=sprint></div>
   </div>
   <div class="card logcard">
-   <h2>Registro</h2>
+   <div class=loghead><h2>Registro</h2>
+    <button class=copylog id=copylog type=button aria-label="Copiar todo el registro" title="Copiar todo el registro" disabled>
+     <svg viewBox="0 0 24 24" fill=none stroke-width=2 stroke-linecap=round stroke-linejoin=round><rect x=9 y=9 width=11 height=11 rx=2/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><span id=copylogtxt>Copiar todo</span>
+    </button>
+   </div>
    <div class=log id=log aria-live=polite><span class=empty>Sin corrida seleccionada.</span></div>
   </div>
  </div>
@@ -231,7 +241,7 @@ const AGENTS=[["product","Producto"],["architect","Arquitecto"],["dev_backend","
 const CHECK='<svg viewBox="0 0 24 24" fill=none stroke-width=3 stroke-linecap=round stroke-linejoin=round><path d="M20 6 9 17l-5-5"/></svg>';
 const X='<svg viewBox="0 0 24 24" fill=none stroke-width=3 stroke-linecap=round stroke-linejoin=round><path d="M18 6 6 18M6 6l12 12"/></svg>';
 const $=id=>document.getElementById(id);
-let CFG={keys:{},agent_addons:{}},polling=null;
+let CFG={keys:{},agent_addons:{}},polling=null,LOG_LINES=[];
 const dag=$("dag");
 NODES.forEach((n,i)=>{dag.insertAdjacentHTML("beforeend",`<div class=node id="nd-${n[0]}"><div class=ring id="rg-${n[0]}"></div><div class=nm>${n[1]}</div><div class=gt id="mk-${n[0]}"></div></div>`);
  if(i<NODES.length-1)dag.insertAdjacentHTML("beforeend",`<div class=conn id="cn-${i}"></div>`);});
@@ -265,7 +275,8 @@ function paint(s){
   node.className="node "+st;
   if(i>0){const cn=$("cn-"+(i-1));if(cn)cn.className="conn"+(done.has(id)||st==="done"?" on":"")}});
  const log=$("log");
- if(s.log&&s.log.length){log.innerHTML=s.log.map(l=>`<span class="${logClass(l)}">${esc(l)}</span>`).join("\n");log.scrollTop=log.scrollHeight}
+ LOG_LINES=Array.isArray(s.log)?s.log:[];$("copylog").disabled=!LOG_LINES.length;
+ if(LOG_LINES.length){log.innerHTML=LOG_LINES.map(l=>`<span class="${logClass(l)}">${esc(l)}</span>`).join("\n");log.scrollTop=log.scrollHeight}
  else log.innerHTML='<span class=empty>Sin log.</span>';
  paintSprint(s.sprint||[])}
 function paintSprint(t){const el=$("sprint");if(!el)return;
@@ -321,6 +332,13 @@ $("theme").onchange=()=>applyTheme($("theme").value);
 $("project").oninput=pathPrev;$("task").oninput=pathPrev;$("outbase").oninput=pathPrev;
 $("refreshtasks").onclick=loadTasks;$("projsel").onchange=loadTasks;
 function toast(id){const s=$(id);s.textContent="✓ guardado";s.style.opacity=1;setTimeout(()=>s.style.opacity=0,2000)}
+function legacyCopy(text){const a=document.createElement("textarea");a.value=text;a.setAttribute("readonly","");a.style.position="fixed";a.style.opacity="0";
+ document.body.appendChild(a);a.select();try{return document.execCommand("copy")}finally{a.remove()}}
+function copyFeedback(text){const el=$("copylogtxt");el.textContent=text;setTimeout(()=>el.textContent="Copiar todo",1600)}
+async function copyLog(){const text=LOG_LINES.join("\n");if(!text){copyFeedback("Sin registro");return}
+ try{if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(text);else if(!legacyCopy(text))throw new Error("copy");
+  copyFeedback("✓ Copiado")}catch(_){copyFeedback("No se pudo copiar")}}
+$("copylog").onclick=copyLog;
 $("savecfg").onclick=()=>fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
  body:JSON.stringify({output_base:$("outbase").value,theme:$("theme").value,provider:$("provider").value,keys:{[$("provider").value]:$("key").value}})})
  .then(r=>r.json()).then(c=>{c.model_choices=CFG.model_choices;CFG=c;CFG.keys=c.keys||{};fillModels($("provider").value,$("model").value);toast("saved")});
@@ -332,7 +350,7 @@ $("go").onclick=()=>{const idea=$("idea").value,key=$("key").value,project=$("pr
  if(!idea.trim()){alert("Escribe la idea");return}
  if(!key.trim()){alert("Configura el proveedor y su API key en la pestaña Configuración");return}
  const b=$("go");b.disabled=true;$("gotxt").textContent="Ejecutando…";const sv=b.querySelector("svg");if(sv)sv.style.display="none";
- b.insertAdjacentHTML("afterbegin",'<span class=spin id=sp></span>');$("log").innerHTML='<span class=l-dim>Arrancando…</span>';
+ b.insertAdjacentHTML("afterbegin",'<span class=spin id=sp></span>');LOG_LINES=[];$("copylog").disabled=true;$("log").innerHTML='<span class=l-dim>Arrancando…</span>';
  fetch("/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({idea,provider:$("provider").value,model:$("model").value,key,project,task:$("task").value})})
   .then(r=>r.json()).then(j=>{if(j.error){alert(j.error);stopBtn();return}if(!polling)polling=setInterval(poll,1000);poll()})
   .catch(()=>{alert("no pude contactar el servidor");stopBtn()})};
