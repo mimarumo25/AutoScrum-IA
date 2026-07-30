@@ -44,9 +44,10 @@ Caracteristica: Reinscripcion
 
 
 def sin_credenciales(**extra):
-    """Entorno sin ninguna API key: garantiza que la prueba no llama a un modelo."""
+    """Entorno y config sin API keys: garantiza que no se llama a un modelo."""
     env = {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
     env["ANTHROPIC_API_KEY"] = ""
+    env["SDD_CONFIG_PATH"] = os.devnull
     env.pop("SDD_SIMULATE", None)
     env.update(extra)
     return env

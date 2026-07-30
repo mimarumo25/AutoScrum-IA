@@ -10,13 +10,14 @@ Estructura de salida por defecto:  <raiz>/project/<proyecto>/<tarea>/
 SEGURIDAD: config.json puede contener API keys en claro. Esta en .gitignore.
 """
 import json
+import os
 import re
 import tomllib
 from pathlib import Path
 
-PKG = Path(__file__).resolve().parent      # el paquete sdd/
+PKG = Path(__file__).resolve().parents[1]  # el paquete sdd/
 ROOT = PKG.parent                          # la raiz del repo
-CONFIG_PATH = ROOT / "config.json"
+CONFIG_PATH = Path(os.environ.get("SDD_CONFIG_PATH") or ROOT / "config.json")
 PIPELINE_PATH = PKG / "pipeline.toml"
 
 AGENT_NODES = ["product", "architect", "planner", "dev_backend", "dev_frontend", "qa"]
@@ -33,6 +34,16 @@ AGENT_TOOLS = {
     "dev_frontend": ["filesystem", "git", "tests", "gates"],
     "qa": ["filesystem", "tests", "gates", "traceability"],
 }
+AGENT_TEMPERATURES = {
+    "product": 0.4,
+    "architect": 0.2,
+    "planner": 0.1,
+    "dev_backend": 0.1,
+    "dev_frontend": 0.1,
+    "qa": 0.1,
+}
+AGENT_BUNDLE_SCHEMA = "autoscrum.agent-bundle/v1"
+AGENT_BUNDLE_VERSION = "0.3.1"
 
 # .gitignore que se siembra en todo repo objetivo. Desde que el gate G9 EJECUTA la
 # suite, el arbol se llena de artefactos de ejecucion (__pycache__, coverage,
@@ -60,7 +71,32 @@ DEFAULTS = {
     "agent_addons": {},   # {nodo: texto extra para su system prompt}
     "agent_profiles": {}, # parametros por agente, persistidos localmente
     "custom_agents": [],  # agentes disponibles para asignacion manual/futura
+    "routing": {
+        "mode": "adaptive",
+        "role_tiers": {
+            "product": "frontier", "architect": "frontier", "planner": "frontier",
+            "dev_backend": "economy", "dev_frontend": "economy", "qa": "balanced",
+        },
+        "provider_priority": [
+            "anthropic", "openai", "glm", "kimi", "deepseek", "qwen",
+        ],
+        "model_catalog": {},
+        "reviewer": {
+            "provider": "", "model": "", "tier": "frontier",
+            "prefer_different_provider": True,
+        },
+        "max_frontier_escalations_per_task": 1,
+    },
 }
+
+
+def _merge_dict(base: dict, patch: dict) -> dict:
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _merge_dict(dict(base[key]), value)
+        else:
+            base[key] = value
+    return base
 
 
 def load() -> dict:
@@ -69,7 +105,7 @@ def load() -> dict:
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                cfg.update(data)
+                cfg = _merge_dict(cfg, data)
         except (ValueError, OSError):
             pass
     if not isinstance(cfg.get("keys"), dict):
@@ -80,7 +116,33 @@ def load() -> dict:
         cfg["agent_profiles"] = {}
     if not isinstance(cfg.get("custom_agents"), list):
         cfg["custom_agents"] = []
+    if not isinstance(cfg.get("routing"), dict):
+        cfg["routing"] = json.loads(json.dumps(DEFAULTS["routing"]))
     return cfg
+
+
+def key_env_name(provider: str) -> str:
+    """Variable de entorno que cubre a este proveedor, segun el mapa del router.
+
+    El import es diferido a proposito: model_router usa config.load(), asi que
+    importarlo arriba cerraria un ciclo. Duplicar el mapa aqui seria peor — dos
+    fuentes de verdad para lo mismo es exactamente el problema que se acaba de
+    eliminar en la clasificacion de tiers.
+    """
+    try:
+        from sdd.integrations.model_router import KEY_ENV
+    except ImportError:                      # pragma: no cover - defensa de arranque
+        return ""
+    return KEY_ENV.get(provider, "")
+
+
+def plaintext_key_providers() -> list[str]:
+    """Proveedores cuya API key esta en claro en config.json.
+
+    Lo consume `sdd doctor` para que el riesgo se vea, en vez de quedar solo como una
+    nota en el README. Devuelve nombres de proveedor, nunca material secreto.
+    """
+    return sorted(prov for prov, key in (load().get("keys") or {}).items() if key)
 
 
 def save(patch: dict) -> dict:
@@ -89,8 +151,17 @@ def save(patch: dict) -> dict:
         if patch.get(k) is not None and str(patch.get(k)) != "":
             cfg[k] = patch[k]
     for prov, key in (patch.get("keys") or {}).items():
-        if key:
-            cfg["keys"][prov] = key
+        if not key:
+            continue
+        # Si el proveedor ya tiene su variable de entorno definida, NO se duplica el
+        # secreto a disco: providers.py y credential_present() ya leen el entorno, asi
+        # que persistirlo solo agrega una copia en claro que nadie necesita. Guardar en
+        # config.json sigue siendo posible para quien no use variables de entorno.
+        env_name = key_env_name(prov)
+        if env_name and os.environ.get(env_name):
+            cfg["keys"].pop(prov, None)
+            continue
+        cfg["keys"][prov] = key
     if isinstance(patch.get("agent_addons"), dict):
         for node, txt in patch["agent_addons"].items():
             cfg["agent_addons"][node] = txt   # cadena vacia SÍ borra (es intencional)
@@ -110,6 +181,7 @@ def save(patch: dict) -> dict:
                 clean["max_tokens"] = 0
             clean["tools"] = [str(t) for t in profile.get("tools", []) if str(t).strip()]
             clean["prompt_addon"] = str(profile.get("prompt_addon", ""))
+            clean["system_prompt"] = str(profile.get("system_prompt", ""))
             node_id = slug(str(node))
             cfg["agent_profiles"][node_id] = clean
             cfg["agent_addons"][node_id] = clean["prompt_addon"]
@@ -118,6 +190,9 @@ def save(patch: dict) -> dict:
             dict(agent) for agent in patch["custom_agents"]
             if isinstance(agent, dict) and slug(str(agent.get("id", ""))) not in AGENT_NODES
         ]
+    if isinstance(patch.get("routing"), dict):
+        cfg["routing"] = _merge_dict(
+            dict(cfg.get("routing") or DEFAULTS["routing"]), patch["routing"])
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     # Las API keys van en claro (cifrarlas exigiria un llavero del SO y una
     # dependencia nueva; queda fuera de v0). Mitigacion: el archivo esta en
@@ -136,9 +211,11 @@ def agent_profile(node_id: str) -> dict:
     cfg = load()
     stored = cfg.get("agent_profiles", {}).get(node_id, {})
     profile = {
-        "enabled": True, "provider": "", "model": "", "temperature": 0.2,
+        "enabled": True, "provider": "", "model": "",
+        "temperature": AGENT_TEMPERATURES.get(node_id, 0.2),
         "max_tokens": 0, "tools": list(AGENT_TOOLS.get(node_id, ["filesystem"])),
         "prompt_addon": cfg.get("agent_addons", {}).get(node_id, ""),
+        "system_prompt": "",
     }
     if isinstance(stored, dict):
         profile.update(stored)
@@ -158,28 +235,59 @@ def agent_catalog() -> list[dict]:
             continue
         prompt_path = PKG / str(node.get("prompt", ""))
         try:
-            prompt_base = prompt_path.read_text(encoding="utf-8")
+            default_prompt = prompt_path.read_text(encoding="utf-8")
         except OSError:
-            prompt_base = ""
+            default_prompt = ""
+        profile = agent_profile(node_id)
+        prompt_base = str(profile.get("system_prompt") or "").strip() or default_prompt
         result.append({
             "id": node_id, "name": AGENT_ROLES.get(node_id, node_id.replace("_", " ").title()),
             "role": AGENT_ROLES.get(node_id, "Custom agent"), "built_in": True,
             "prompt_path": str(node.get("prompt", "")), "prompt_base": prompt_base,
+            "default_prompt": default_prompt,
             "writes": node.get("writes", []), "must_produce": node.get("must_produce", []),
             "gates": node.get("gates", []), "task_node": bool(node.get("task_node")),
-            "next": node.get("next", ""), **agent_profile(node_id),
+            "next": node.get("next", ""), **profile,
         })
     for custom in load().get("custom_agents", []):
         node_id = slug(str(custom.get("id", "")))
+        profile = agent_profile(node_id)
+        default_prompt = str(custom.get("prompt_base", ""))
+        prompt_base = str(profile.get("system_prompt") or "").strip() or default_prompt
         result.append({
             "id": node_id, "name": custom.get("name") or node_id.replace("_", " ").title(),
             "role": custom.get("role") or "Custom agent", "built_in": False,
-            "prompt_path": "", "prompt_base": custom.get("prompt_base", ""),
+            "prompt_path": "", "prompt_base": prompt_base, "default_prompt": default_prompt,
             "writes": custom.get("writes", []), "must_produce": [],
             "gates": custom.get("gates", []), "task_node": True, "next": "task_loop",
-            **agent_profile(node_id),
+            **profile,
         })
     return result
+
+
+def agent_bundle() -> dict:
+    """Configuracion portable de agentes, sin proveedores ni secretos."""
+    agents = agent_catalog()
+    profiles = {}
+    for agent in agents:
+        profiles[agent["id"]] = {
+            "enabled": bool(agent.get("enabled", True)),
+            "provider": str(agent.get("provider", "")),
+            "model": str(agent.get("model", "")),
+            "temperature": agent.get("temperature", 0.2),
+            "max_tokens": agent.get("max_tokens", 0),
+            "tools": list(agent.get("tools", [])),
+            "system_prompt": str(agent.get("prompt_base", "")),
+            "prompt_addon": str(agent.get("prompt_addon", "")),
+        }
+    custom = [agent for agent in load().get("custom_agents", [])
+              if isinstance(agent, dict)]
+    return {
+        "schema_version": AGENT_BUNDLE_SCHEMA,
+        "version": AGENT_BUNDLE_VERSION,
+        "agents": profiles,
+        "custom_agents": custom,
+    }
 
 def slug(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_.-]+", "-", (name or "").strip())
@@ -237,7 +345,7 @@ def list_tasks(project: str, output_base=None):
         return []
     out = []
     for t in sorted(proj.iterdir()):
-        if not t.is_dir():
+        if not t.is_dir() or t.name.startswith("."):
             continue
         sp = t / ".agent/state.json"
         info = {"task": t.name, "has_run": sp.exists()}
@@ -250,6 +358,6 @@ def list_tasks(project: str, output_base=None):
 
 def masked() -> dict:
     cfg = load()
-    cfg["keys"] = {p: (k[:6] + "…" + k[-4:] if len(k) > 12 else "•••")
-                   for p, k in cfg["keys"].items()}
+    cfg["key_status"] = {p: bool(k) for p, k in cfg["keys"].items()}
+    cfg["keys"] = {}
     return cfg

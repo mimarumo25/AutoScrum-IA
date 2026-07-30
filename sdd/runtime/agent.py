@@ -30,12 +30,11 @@ import sys
 import tomllib
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import config  # noqa: E402
-import providers  # noqa: E402
-import chronicle  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from sdd.core import chronicle, config, lifecycle  # noqa: E402
+from sdd.integrations import model_router, providers  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except (AttributeError, ValueError):
@@ -89,6 +88,21 @@ salir del paso: responde con una sola linea
 
 Un mock que tapa un entregable ausente convierte un fallo visible en uno invisible.
 """
+
+
+def compose_system_prompt(node_cfg: dict, profile: dict) -> str:
+    """Compone el prompt efectivo: override portable, addon y capacidades."""
+    default_prompt = (ROOT / node_cfg["prompt"]).read_text(encoding="utf-8")
+    system_prompt = str(profile.get("system_prompt") or "").strip() or default_prompt
+    addon = str(profile.get("prompt_addon") or "").strip()
+    if addon:
+        system_prompt += ("\n\n## Complemento del operador (aplícalo además de lo anterior)\n"
+                          + addon)
+    tools = [str(tool) for tool in profile.get("tools", []) if str(tool).strip()]
+    if tools:
+        system_prompt += ("\n\n## Capacidades habilitadas por el operador\n" +
+                          "Utiliza solo estas capacidades: " + ", ".join(tools))
+    return system_prompt
 
 
 def parse_files(text: str):
@@ -214,6 +228,15 @@ def gather_task(workdir: Path):
     return "\n".join(lines), list(t.get("context") or []) + list(t.get("deliverables") or [])
 
 
+def active_task(workdir: Path) -> dict:
+    path = workdir / ".agent/current_task.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def gather_defects(workdir: Path, node: str) -> str:
     """Defectos del ciclo anterior para este nodo, para que el modelo los corrija."""
     reports = workdir / ".agent/reports"
@@ -252,32 +275,28 @@ def main():
     if not profile.get("enabled", True):
         print(f"  [agent] BLOQUEADO: {node} esta desactivado por el operador", file=sys.stderr)
         return 3
-    provider = str(profile.get("provider") or "").strip()
-    model = str(profile.get("model") or "").strip()
-    if provider:
-        os.environ["SDD_PROVIDER"] = provider
-        key_env = ("ANTHROPIC_API_KEY" if provider == "anthropic" else
-                   "SDD_API_KEY" if provider == "openai" else
-                   (providers.OPENAI_PRESETS.get(provider) or {}).get("key_env", ""))
-        key = config.load().get("keys", {}).get(provider, "")
-        if key_env and key:
-            os.environ[key_env] = key
-    if model:
-        os.environ["SDD_MODEL"] = model
+    runtime_cfg = config.load()
+    task_data = active_task(workdir)
+    try:
+        selection = model_router.resolve_agent(node, task_data, runtime_cfg)
+    except model_router.ModelRoutingError as error:
+        print(f"  [agent] error de routing: {error}", file=sys.stderr)
+        return 1
+    selection_path = workdir / ".agent/model-selections" / f"{node}.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text(json.dumps(selection, indent=2, ensure_ascii=False),
+                              encoding="utf-8")
+    if task_data.get("id"):
+        task_data["model_selection"] = selection
+        (workdir / ".agent/current_task.json").write_text(
+            json.dumps(task_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        lifecycle.model_selected(workdir, str(task_data["id"]), selection)
     os.environ["SDD_TEMPERATURE"] = str(profile.get("temperature", 0.2))
     if int(profile.get("max_tokens") or 0) > 0:
         os.environ["SDD_MAX_TOKENS"] = str(profile["max_tokens"])
 
     allowed = node_cfg.get("writes", [])
-    system_prompt = (ROOT / node_cfg["prompt"]).read_text(encoding="utf-8")
-    addon = str(profile.get("prompt_addon") or "").strip()
-    if addon:
-        system_prompt += ("\n\n## Complemento del operador (aplícalo además de lo anterior)\n"
-                          + addon)
-    tools = [str(tool) for tool in profile.get("tools", []) if str(tool).strip()]
-    if tools:
-        system_prompt += ("\n\n## Capacidades habilitadas por el operador\n" +
-                          "Utiliza solo estas capacidades: " + ", ".join(tools))
+    system_prompt = compose_system_prompt(node_cfg, profile)
 
     intake_path = workdir / "spec/00_intake.yaml"
     intake = intake_path.read_text(encoding="utf-8") if intake_path.exists() else \
@@ -293,24 +312,25 @@ def main():
         PROTOCOL.format(allowed=allowed),
     ]))
 
-    prov = providers.describe()
-    print(f"  [agent] nodo={node} proveedor={prov.get('provider')} "
-          f"modelo={prov.get('model')} contexto={len(user)} chars", flush=True)
-
     try:
-        text = providers.complete(system_prompt, user)
+        with model_router.selection_environment(selection, runtime_cfg):
+            prov = providers.describe()
+            print(f"  [agent] nodo={node} proveedor={prov.get('provider')} "
+                  f"modelo={prov.get('model')} tier={selection['tier']} "
+                  f"contexto={len(user)} chars", flush=True)
+            text = providers.complete(system_prompt, user)
     except providers.ProviderError as e:
         print(f"  [agent] error de proveedor: {e}", file=sys.stderr)
         _archive_call(workdir, node, system_prompt, user, text="",
                       written=[], skipped=[], returncode=1,
-                      detail=f"ProviderError: {e}")
+                      detail=f"ProviderError: {e}", selection=selection)
         return 1
     except Exception as e:  # noqa: BLE001 — reportar limpio, no traceback crudo
         print(f"  [agent] fallo la llamada al modelo: {type(e).__name__}: {e}",
               file=sys.stderr)
         _archive_call(workdir, node, system_prompt, user, text="",
                       written=[], skipped=[], returncode=1,
-                      detail=f"{type(e).__name__}: {e}")
+                      detail=f"{type(e).__name__}: {e}", selection=selection)
         return 1
 
     blocked = BLOCKED_BLOCK.search(text)
@@ -325,7 +345,8 @@ def main():
         return 1
     written, skipped = write_files(workdir, allowed, files)
     _archive_call(workdir, node, system_prompt, user, text,
-                  written=written, skipped=skipped, returncode=0)
+                  written=written, skipped=skipped, returncode=0,
+                  selection=selection)
     for w in written:
         print(f"  [agent] escrito {w}", flush=True)
     for rel, why in skipped:
@@ -334,14 +355,16 @@ def main():
         print("  [agent] ningun archivo cayo dentro de los paths permitidos",
               file=sys.stderr)
         _archive_call(workdir, node, system_prompt, user, text,
-                      written=written, skipped=skipped, returncode=1)
+                      written=written, skipped=skipped, returncode=1,
+                      selection=selection)
         return 1
     return 0
 
 
 def _archive_call(workdir: Path, node: str, system_prompt: str, user: str,
                   text: str, *, written: list, skipped: list,
-                  returncode: int = 0) -> None:
+                  returncode: int = 0, detail: str = "",
+                  selection: dict | None = None) -> None:
     visit_id = os.environ.get("SDD_VISIT_ID")
     if not visit_id:
         return
@@ -353,11 +376,12 @@ def _archive_call(workdir: Path, node: str, system_prompt: str, user: str,
         user_prompt=user,
         response_text=text,
         stdout_text="",
-        stderr_text="",
+        stderr_text=detail,
         returncode=returncode,
         files_written=written,
         files_skipped=skipped,
         token_usage=usage,
+        model_selection=selection,
     )
 
 

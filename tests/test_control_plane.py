@@ -4,6 +4,7 @@ esta suite si.
 
     python -m unittest discover -s tests
 """
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
-from orchestrator import route  # noqa: E402
+from sdd.runtime.orchestrator import route
 
 PY = sys.executable
 
@@ -78,15 +79,20 @@ class TestBudgetEscalation(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wd = self._demo_repo(tmp)
             proc = subprocess.run(
-                [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd),
+                [PY, "-m", "sdd.runtime.orchestrator", "--workdir", str(wd),
                  "--simulate", "--auto-approve-human"],
                 capture_output=True, text=True,
                 env={**__import__("os").environ, "SDD_FAKE_STUCK": "1"})
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("estado final: escalated", proc.stdout)
             self.assertIn("ESCALATE_HUMAN", proc.stdout)
-            # Techo de reintentos = 2 => escala en el 3er intento, no antes ni mucho despues.
-            self.assertLessEqual(proc.stdout.count("AGENTE"), 5, proc.stdout)
+            # Techo de reintentos = 2 (=> agota en el 3er intento) + 1 escalado de
+            # modelo permitido = 4 llamadas. Se mide sobre el contador explicito del
+            # orquestador: contar el substring "AGENTE" coincidia con AGENTE_INICIO,
+            # AGENTE y AGENTE_EN_ESPERA a la vez, asi que medía vocabulario de log en
+            # lugar de llamadas al agente.
+            llamadas = int(re.search(r"llamadas a agente: (\d+)", proc.stdout).group(1))
+            self.assertEqual(llamadas, 4, proc.stdout)
 
 
 if __name__ == "__main__":

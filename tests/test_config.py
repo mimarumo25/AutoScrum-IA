@@ -1,12 +1,15 @@
 """Pruebas de la configuracion persistente (config.py), aisladas en un tmpdir."""
+import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
-import config  # noqa: E402
+from sdd.core import config
 
 
 class ConfigCase(unittest.TestCase):
@@ -19,6 +22,41 @@ class ConfigCase(unittest.TestCase):
     def tearDown(self):
         config.ROOT, config.CONFIG_PATH = self._root, self._cp
         self._tmp.cleanup()
+
+
+class TestCredenciales(ConfigCase):
+    """Una key en claro en disco es una copia del secreto que nadie pidio."""
+
+    def test_no_duplica_el_secreto_si_la_variable_de_entorno_esta_definida(self):
+        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "sk-del-entorno"}):
+            config.save({"keys": {"deepseek": "sk-desde-la-ui"}})
+        self.assertEqual(config.load()["keys"], {},
+                         "con la variable definida no hace falta guardarla en disco")
+
+    def test_sigue_guardando_para_quien_no_usa_variables(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+            config.save({"keys": {"deepseek": "sk-desde-la-ui"}})
+        self.assertEqual(config.load()["keys"]["deepseek"], "sk-desde-la-ui")
+
+    def test_reporta_los_proveedores_en_claro_sin_revelar_la_key(self):
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+        config.save({"keys": {"deepseek": "sk-secreta"}})
+        reporte = config.plaintext_key_providers()
+        self.assertEqual(reporte, ["deepseek"])
+        self.assertNotIn("sk-secreta", str(reporte))
+
+    def test_masked_nunca_devuelve_material_secreto(self):
+        os.environ.pop("DEEPSEEK_API_KEY", None)
+        config.save({"keys": {"deepseek": "sk-secreta"}})
+        visible = config.masked()
+        self.assertEqual(visible["keys"], {})
+        self.assertTrue(visible["key_status"]["deepseek"])
+        self.assertNotIn("sk-secreta", json.dumps(visible))
+
+    def test_el_nombre_de_variable_sale_del_router_no_de_una_copia(self):
+        self.assertEqual(config.key_env_name("anthropic"), "ANTHROPIC_API_KEY")
+        self.assertEqual(config.key_env_name("deepseek"), "DEEPSEEK_API_KEY")
 
 
 class TestLoadSave(ConfigCase):
@@ -65,13 +103,20 @@ class TestResolveOutput(ConfigCase):
         self.assertEqual(config.slug("Hola Mundo"), "Hola-Mundo")
         self.assertEqual(config.slug("  "), "sin-nombre")
 
+    def test_list_tasks_omite_directorios_internos(self):
+        project = config.ROOT / "project" / "demo"
+        (project / ".sdd-locks").mkdir(parents=True)
+        (project / "tarea-visible").mkdir()
+        tasks = config.list_tasks("demo")
+        self.assertEqual([item["task"] for item in tasks], ["tarea-visible"])
+
 
 class TestMasked(ConfigCase):
-    def test_enmascara_llaves(self):
+    def test_no_expone_llaves(self):
         config.save({"keys": {"anthropic": "sk-ant-1234567890abcd"}})
         m = config.masked()
-        self.assertNotEqual(m["keys"]["anthropic"], "sk-ant-1234567890abcd")
-        self.assertIn("…", m["keys"]["anthropic"])
+        self.assertEqual(m["keys"], {})
+        self.assertTrue(m["key_status"]["anthropic"])
 
 
 if __name__ == "__main__":

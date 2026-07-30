@@ -84,6 +84,53 @@ Escribir fuera de tus paths = violación de propiedad → revert automático.
 documentación oficial** — no lo escribas de memoria. El paquete se diseñó con un
 corte de conocimiento anterior; los nombres de campo cambian entre versiones.
 
+## Descubrimiento de código: primero el grafo, no `grep`
+
+Este repo está indexado en `codebase-memory-mcp` bajo el nombre de proyecto
+**`D-Miguel-auto_scrum`**. Ese es el valor del parámetro `project` en todas las
+llamadas. El grafo guarda firmas, tipos de retorno, docstrings, aristas `CALLS`
+y métricas de complejidad; también un ADR con la arquitectura del sistema.
+
+**Empieza por el ADR.** `manage_adr(project, mode="get")` devuelve propósito,
+stack, arquitectura, patrones, trade-offs y filosofía sin leer un solo archivo.
+Es la vía más corta para entender el proyecto al abrir una sesión.
+
+Qué herramienta usar:
+
+| Necesitas | Usa |
+|---|---|
+| Entender el sistema de golpe | `manage_adr(mode="get")` |
+| Estructura, clusters, capas, hotspots | `get_architecture` |
+| Encontrar una función/clase por concepto | `search_graph(query=...)` (BM25) |
+| Encontrarla por nombre exacto o patrón | `search_graph(name_pattern=...)` |
+| Encontrarla sin saber el vocabulario del repo | `search_graph(semantic_query=["a","b"])` |
+| Quién llama a esto / qué rompo si lo cambio | `trace_path(mode="calls")` |
+| Cómo se propaga un valor | `trace_path(mode="data_flow")` |
+| Leer el código exacto de un símbolo | `get_code_snippet(qualified_name)` |
+| Patrones multi-salto o agregaciones | `query_graph` (Cypher) |
+| Impacto de lo que cambió en la rama | `detect_changes` |
+
+`search_graph` trunca en `limit` (200 por defecto): si `has_more` es `true`,
+pagina con `offset` en lugar de asumir que viste todo.
+
+`Grep`/`Glob`/`Read` siguen siendo correctos para prosa, configuración, TOML,
+YAML, literales de cadena y archivos no-código — y **siempre** hay que `Read` un
+archivo antes de editarlo. Lo que no se hace es descubrir símbolos a ciegas con
+`grep` cuando el grafo ya los tiene resueltos por tipo.
+
+### Mantener el índice honesto
+
+- El indexador **respeta `.gitignore`**. Esa lista define el alcance del índice,
+  así que un directorio de artefactos sin ignorar mete código de fixture
+  (`src/domain/matricula.py`, worktrees de prueba) en el grafo como si fuera
+  código del proyecto. Si añades un directorio generado, ignóralo.
+- `index_repository` es incremental y **no purga** nodos de archivos que salieron
+  del alcance. Para eliminarlos hace falta `delete_project` y reindexar.
+- Usa `mode="full"`: es el que calcula las aristas de similitud y los embeddings
+  que habilitan `semantic_query`.
+- Reindexa tras un cambio estructural; el grafo se ancla al `head_sha` y no ve el
+  árbol de trabajo sucio hasta que lo reconstruyes.
+
 ## Cómo se corre (una sola app, un solo comando)
 
 Es un paquete `sdd/` instalable. Tras `pip install -e .`:

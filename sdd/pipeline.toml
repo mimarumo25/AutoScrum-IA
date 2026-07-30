@@ -8,7 +8,7 @@
 # Agente real: lee la idea + estado del repo + su tarea + defectos, llama al proveedor
 # LLM (Anthropic o modelo chino, ver providers.py) y escribe archivos en sus paths.
 # El proveedor y la key se eligen por variables de entorno (SDD_PROVIDER, *_API_KEY).
-agent_cmd = "{py} {root}/agent.py {node} {workdir}"
+agent_cmd = "{py} -m sdd.runtime.agent {node} {workdir}"
 # Comando usado por `--simulate`: no consume tokens, sirve para probar el plano de control.
 simulate_cmd = "{py} {root}/examples/fake_agent.py {node} {workdir}"
 # Tareas listas se ejecutan en worktrees aislados. LangGraph solo agrupa en el

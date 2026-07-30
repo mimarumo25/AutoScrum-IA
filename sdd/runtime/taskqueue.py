@@ -11,6 +11,7 @@ Estados de una tarea:
   pending  — lista para ejecutarse cuando sus dependencias esten done
   done     — su nodo la ejecuto y todos sus gates dieron verde
   blocked  — un gate la mando a otro dueno; espera a que cierre la tarea D-###
+  needs_input — la rama necesita ayuda; las tareas independientes pueden continuar
 
 El orquestador solo transporta punteros; el estado vive en .agent/state.json y
 la tarea activa se publica en .agent/current_task.json para que el agente la lea.
@@ -20,7 +21,7 @@ from pathlib import Path
 
 import yaml
 
-import lifecycle
+from sdd.core import lifecycle
 
 PLAN_PATH = "spec/30_plan/tasks.yaml"
 CURRENT_PATH = ".agent/current_task.json"
@@ -84,6 +85,32 @@ def next_runnable(tasks):
 
 def pending(tasks):
     return [t for t in tasks if t["status"] != "done"]
+
+
+def mark_needs_input(tasks, tid, reason, gate_id=""):
+    """Pausa solo una rama sin convertir el proyecto completo en un fallo."""
+    task = by_id(tasks, tid)
+    if task is None:
+        return None
+    task["status"] = "needs_input"
+    task["attention_reason"] = str(reason)
+    if gate_id:
+        task["attention_gate"] = str(gate_id)
+    task.pop("blocked_by", None)
+    return task
+
+
+def reactivate_attention_tasks(tasks):
+    """Al reanudar, vuelve a poner en cola únicamente las ramas pausadas."""
+    reactivated = []
+    for task in tasks:
+        if task.get("status") != "needs_input":
+            continue
+        task["status"] = "pending"
+        task.pop("attention_reason", None)
+        task.pop("attention_gate", None)
+        reactivated.append(str(task["id"]))
+    return reactivated
 
 
 def progress(tasks):

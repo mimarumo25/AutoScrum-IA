@@ -12,12 +12,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import metrics
-import process_control
+from sdd.core import metrics, process_control
 
-GATES = Path(__file__).resolve().parent / "gates"
-sys.path.insert(0, str(GATES))
-from run_gates import gates_for, load_registry  # noqa: E402
+GATES = Path(__file__).resolve().parents[1] / "gates"
+from sdd.gates.run_gates import gates_for, load_registry
 
 
 def _task(workdir: str) -> dict[str, object]:

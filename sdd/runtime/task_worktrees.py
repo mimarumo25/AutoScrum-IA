@@ -3,7 +3,7 @@ import json
 import re
 from pathlib import Path
 
-import process_control
+from sdd.core import process_control
 
 
 def _git(repo: str | Path, *args: str, data: bytes | None = None):

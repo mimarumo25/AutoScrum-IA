@@ -20,20 +20,15 @@ import tomllib
 import webbrowser
 from pathlib import Path
 
-import config
-import providers
-import report
-import task_worktrees
-import metrics
-import process_control
-import run_lease
-import lifecycle
-import chronicle
+from sdd.core import chronicle, config, lifecycle, metrics, process_control, run_lease
+from sdd.integrations import providers
+from sdd.presentation import report
+from sdd.runtime import task_worktrees
 
 KEY_ENV = {"anthropic": "ANTHROPIC_API_KEY", "openai": "SDD_API_KEY"}
 KEY_ENV.update({p: c["key_env"] for p, c in providers.OPENAI_PRESETS.items()})
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
 
 # La consola de Windows suele ser cp1252; forzamos UTF-8 para los glifos del visor.
@@ -71,7 +66,7 @@ def demo(a):
     (wd / ".gitignore").write_text(config.GITIGNORE, encoding="utf-8")
     git(wd, "add", "-A")
     git(wd, "commit", "-qm", "init")
-    return sh(PY, ROOT / "orchestrator.py", "--workdir", wd,
+    return sh(PY, "-m", "sdd.runtime.orchestrator", "--workdir", wd,
               "--simulate", "--autonomous").returncode
 
 
@@ -119,6 +114,19 @@ def doctor(a):
         print(f"  {k:12}: {v}")
     ready = prov.get("key_present") and "error" not in prov
     print("  listo       :", "SI" if ready else "NO — define la API key de arriba")
+
+    # El riesgo tiene que verse al ejecutar, no solo en una nota del README: una key en
+    # claro sobrevive a backups, sincronizaciones de carpeta y capturas de pantalla.
+    en_claro = config.plaintext_key_providers()
+    if en_claro:
+        print("\n=== aviso de seguridad ===")
+        print(f"  API keys en claro en {config.CONFIG_PATH}: {', '.join(en_claro)}")
+        for prov_name in en_claro:
+            env_name = config.key_env_name(prov_name) or "(sin variable conocida)"
+            print(f"    {prov_name:10} -> usa la variable {env_name}")
+        print("  Definida la variable, la key deja de guardarse en config.json.")
+        print("  Si la key estuvo expuesta (log, captura, transcript), rotala.")
+
     print("\ncambia de proveedor con:  SDD_PROVIDER=deepseek|qwen|glm|kimi|anthropic")
     return 0 if ready else 1
 
@@ -162,14 +170,14 @@ def run(a):
     print(f"proyecto en: {wd}")
     if _seed_repo(wd, a.intake) is None:
         return 1
-    return subprocess.run([PY, ROOT / "orchestrator.py",
+    return subprocess.run([PY, "-m", "sdd.runtime.orchestrator",
                            "--workdir", str(wd), "--task", a.task]).returncode
 
 
 def resume(a):
     # Sin --node: reanuda desde el cursor guardado (--resume). Con --node: reanuda
     # desde ese nodo concreto (--from). Ambos conservan el trabajo ya commiteado.
-    cmd = [PY, ROOT / "orchestrator.py", "--workdir", a.workdir, "--task", a.task]
+    cmd = [PY, "-m", "sdd.runtime.orchestrator", "--workdir", a.workdir, "--task", a.task]
     cmd += ["--from", a.node] if a.node else ["--resume"]
     if getattr(a, "autonomous", False):
         cmd.append("--autonomous")
@@ -213,7 +221,7 @@ def test(a):
 
 
 def serve(a):
-    import server
+    from sdd import server
     url = f"http://127.0.0.1:{a.port}"
     if not getattr(a, "no_open", False):
         try:
@@ -441,7 +449,7 @@ def _list_chronicle_visits(wd, recent):
               f"prompt={prompt_kb}KB resp={resp_kb}KB  "
               f"{C.gray(vid[:12])}")
     if len(visits) >= recent:
-        print(C.gray(f"  ... y mas. Usa --recent N o --visit-id <id> para ver detalles"))
+        print(C.gray("  ... y mas. Usa --recent N o --visit-id <id> para ver detalles"))
     print()
 
 

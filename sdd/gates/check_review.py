@@ -26,9 +26,11 @@ import re
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # para importar providers
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # para importar proveedores
 
 from _lib import finding, emit  # noqa: E402
+from sdd.core import config  # noqa: E402
+from sdd.integrations import model_router  # noqa: E402
 
 REVIEW_BLOCK = re.compile(r"<<<REVIEW>>>\s*(?P<body>.*?)\s*<<<END>>>", re.S)
 SEVERITIES = ("blocking", "mejora")
@@ -99,21 +101,20 @@ def gather(workdir: Path, node: str) -> str:
     return "\n\n".join(chunks)
 
 
-def ask_model(system: str, user: str) -> str:
-    import providers
-    # El revisor puede correr en otro modelo que el autor: un critico que es
-    # literalmente el mismo modelo tiende a validar su propio criterio.
-    override = os.environ.get("SDD_REVIEW_MODEL")
-    previo = os.environ.get("SDD_MODEL")
-    if override:
-        os.environ["SDD_MODEL"] = override
-    try:
-        return providers.complete(system, user)
-    finally:
-        if override:
-            os.environ.pop("SDD_MODEL", None)
-            if previo is not None:
-                os.environ["SDD_MODEL"] = previo
+def ask_model(system: str, user: str, workdir: Path) -> tuple[str, dict]:
+    from sdd.integrations import providers
+    task = active_task(workdir)
+    author = task.get("model_selection") or {}
+    if not author:
+        author_path = workdir / ".agent/model-selections" / f"{task.get('node') or os.environ.get('SDD_METRICS_NODE', '')}.json"
+        try:
+            author = json.loads(author_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            author = {}
+    selection = model_router.resolve_review(str(author.get("provider") or ""),
+                                            config.load())
+    with model_router.selection_environment(selection, config.load()):
+        return providers.complete(system, user), selection
 
 
 def ask_simulated(node: str, invocacion: int) -> str:
@@ -242,7 +243,8 @@ def main():
         if os.environ.get("SDD_SIMULATE"):
             raw = ask_simulated(a.node, state["invocations"])
         else:
-            raw = ask_model(system, user)
+            raw, selection = ask_model(system, user, wd)
+            state["model_selection"] = selection
         hallazgos, error = parse(raw)
     except Exception as e:  # noqa: BLE001 — un critico caido no tumba la corrida
         hallazgos, error = [], f"{type(e).__name__}: {e}"

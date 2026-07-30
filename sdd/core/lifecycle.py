@@ -93,6 +93,23 @@ def agent_called(workdir: str | Path, task_id: str, returncode: int,
     })
 
 
+def model_selected(workdir: str | Path, task_id: str, selection: dict) -> None:
+    """Registra la decision efectiva del router, nunca sus credenciales."""
+    safe = {key: selection.get(key) for key in (
+        "provider", "model", "tier", "requested_tier",
+        "selection_reason", "fallback_reason", "escalated",
+    )}
+    _emit(workdir, task_id, {"event": "model_selected", **safe})
+
+
+def model_escalated(workdir: str | Path, task_id: str,
+                    gate: str, count: int) -> None:
+    _emit(workdir, task_id, {
+        "event": "model_escalated", "gate": gate,
+        "tier": "frontier", "count": count,
+    })
+
+
 def gate_result(workdir: str | Path, task_id: str, gate_id: str,
                 passed: bool, findings: int = 0) -> None:
     _emit(workdir, task_id, {
@@ -204,6 +221,16 @@ def summary(workdir: str | Path, task_id: str) -> dict[str, object]:
             states["started"] = states.get("started") or at
         elif name == "agent_called":
             calls += 1
+        elif name == "model_selected":
+            states["provider"] = ev.get("provider")
+            states["model"] = ev.get("model")
+            states["tier"] = ev.get("tier")
+            states["selection_reason"] = ev.get("selection_reason")
+            states["fallback_reason"] = ev.get("fallback_reason")
+            states["model_escalated"] = bool(ev.get("escalated"))
+        elif name == "model_escalated":
+            states["model_escalated"] = True
+            states["escalation_gate"] = ev.get("gate")
         elif name == "gate_result":
             gate_name = str(ev.get("gate") or "")
             gate_status[gate_name] = ev.get("status") == "pass"

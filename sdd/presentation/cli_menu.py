@@ -6,7 +6,7 @@ de 500 lineas. Importa `cli` de forma diferida (dentro de las funciones)
 porque cli.py la invoca solo desde main(): cuando se ejecuta, cli ya esta
 cargado, asi que no hay ciclo de importacion.
 """
-import cli
+from sdd.presentation import cli
 
 
 # --- Interfaz interactiva (menú en la terminal) ----------------------------

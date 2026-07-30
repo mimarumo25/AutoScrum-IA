@@ -197,7 +197,7 @@ def _token_usage(wd):
 
 def _performance_section(wd):
     """Resumen compacto de la telemetria local de la corrida."""
-    import metrics as _metrics
+    from sdd.core import metrics as _metrics
     summary = _metrics.summarize(wd)
     if not summary:
         return []

@@ -19,9 +19,9 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver  # noqa: E402
 from langgraph.graph import END, START, StateGraph  # noqa: E402
 from langgraph.types import Command, interrupt  # noqa: E402
 
-from parallel_tasks import ParallelTasks  # noqa: E402
-from human_approval import (approval_record, rejected_record, spec_hash,
-                            waiting_projection)  # noqa: E402
+from sdd.runtime.parallel_tasks import ParallelTasks  # noqa: E402
+from sdd.runtime.human_approval import (approval_record, rejected_record, spec_hash,
+                                        waiting_projection)  # noqa: E402
 
 
 CHECKPOINT_PATH = ".agent/checkpoints.sqlite"
@@ -44,11 +44,19 @@ class PipelineState(TypedDict, total=False):
     attempts: dict[str, int]
     agent_calls: int
     started_at: float
+    original_started_at: float
+    resume_started_at: float
+    resume_history: list[dict[str, object]]
+    resume_checkpoint: dict[str, object]
+    resume_recovery: dict[str, object] | None
     tasks: list[dict[str, object]]
     current_task: str | None
     defect_seq: int
     history: list[dict[str, object]]
     resume_at: str | None
+    resume_stack: list[str]
+    recoveries: list[dict[str, object]]
+    recovery_seq: int
     active_visit: str | None
     human_approval: dict[str, object]
     engine: str
@@ -86,6 +94,9 @@ def _normalize(state: PipelineState) -> PipelineState:
     state.setdefault("attempts", {})
     state.setdefault("current_task", None)
     state.setdefault("resume_at", None)
+    state.setdefault("resume_stack", [])
+    state.setdefault("recoveries", [])
+    state.setdefault("recovery_seq", 0)
     state.setdefault("active_visit", None)
     state.setdefault("batch_seq", 0)
     state.setdefault("parallel_batch", None)
@@ -214,6 +225,11 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
         actor = (str(decision.get("actor", "cli"))
                  if isinstance(decision, dict) else "cli")
         current = waiting
+        # Al reanudar un interrupt, Command.resume debe consumir primero la
+        # interrupción original. Superponemos después la proyección preparada
+        # (presupuesto nuevo, historial y recuperaciones), antes del bootstrap.
+        if approved and resume_requested:
+            current.update(_normalize(_copy_state(initial)))
         if not approved:
             current["status"] = "escalated"
             current["human_approval"] = rejected_record(actor)
@@ -264,6 +280,14 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
                     1, int(cfg["runtime"].get("max_concurrency", 3))),
             }
             before = await graph.aget_state(config)
+            # Fuera de interrupt(), LangGraph no mezcla por sí solo la
+            # proyección preparada con el snapshot. La persistimos antes de
+            # continuar. En interrupt(), hacerlo aquí recrearía la espera; el
+            # human_node aplica la misma superposición tras Command.resume.
+            if (resume_requested and getattr(before, "values", None)
+                    and not _has_interrupt(before)):
+                await graph.aupdate_state(config, initial)
+                before = await graph.aget_state(config)
             if resume_requested and _has_interrupt(before):
                 actor = "autonomous" if auto_human else os.environ.get(
                     "SDD_APPROVAL_ACTOR", "cli")

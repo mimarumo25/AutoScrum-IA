@@ -2,9 +2,26 @@
 __pycache__/
 *.pyc
 *.egg-info/
-.tmp-test/
 .agent/
 .sdd-locks/
 ../demo-repo/
 config.json
 project/
+
+# Artefactos de ejecuciones y pruebas locales. No son codigo del proyecto:
+# contienen repos de fixture (src/domain/matricula.py, worktrees, locks) que
+# el indexador de codebase-memory tomaria como simbolos reales y contaminarian
+# el grafo. El indexador respeta .gitignore, asi que esta lista tambien define
+# el alcance del indice.
+.tmp-test/
+.tmp-tests/
+.tmp-realtime-tests/
+.test-runtime/
+.qa-evidence/
+.qa-tmp/
+.playwright-cli/
+.playwright-mcp/
+.pytest_cache/
+pytest-cache-files-*/
+tmp*/
+output/

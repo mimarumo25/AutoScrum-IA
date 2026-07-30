@@ -14,12 +14,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
-from execution_journal import invoke_once  # noqa: E402
-from graph_runtime import _delta, _merge_results  # noqa: E402
-import cli  # noqa: E402
-import metrics  # noqa: E402
-import parallel_tasks  # noqa: E402
-import task_worktrees  # noqa: E402
+from sdd.core.execution_journal import invoke_once
+from sdd.presentation import cli
+from sdd.runtime.graph_runtime import _delta, _merge_results
+from sdd.core import metrics
+from sdd.runtime import parallel_tasks, task_worktrees
 
 PY = sys.executable
 
@@ -134,9 +133,11 @@ class TestParallelDefectBudget(unittest.TestCase):
         with patch.object(task_worktrees, "cleanup") as cleanup:
             keep_running = runner._collect_one(state, result)
 
-        self.assertFalse(keep_running)
-        self.assertEqual(state["status"], "escalated")
-        self.assertIn("tope de tareas de defecto alcanzado", events[-1][1]["motivo"])
+        self.assertTrue(keep_running)
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(task["status"], "needs_input")
+        self.assertEqual(events[-1][0], "RAMA_EN_ESPERA")
+        self.assertIn("tope de 2 correcciones", events[-1][1]["motivo"])
         cleanup.assert_called_once_with(".", task)
 
 
@@ -206,7 +207,7 @@ class TestDurableHumanGate(unittest.TestCase):
     def test_checkpoint_interrupt_firma_y_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
             wd = git_repo(Path(tmp))
-            base = [PY, str(ROOT / "orchestrator.py"),
+            base = [PY, "-m", "sdd.runtime.orchestrator",
                     "--workdir", str(wd), "--simulate"]
 
             stopped = subprocess.run(base, capture_output=True, text=True)
@@ -228,6 +229,11 @@ class TestDurableHumanGate(unittest.TestCase):
                 connection.close()
             self.assertGreater(count, 0)
 
+            # Reproduce una corrida antigua: la proyección que prepara --resume
+            # trae un reloj nuevo, pero el checkpoint durable conserva el viejo.
+            # El runtime debe superponer la proyección antes de aprobar el gate.
+            state["started_at"] = 1
+            state_path.write_text(json.dumps(state), encoding="utf-8")
             resumed = subprocess.run(base + ["--resume"], capture_output=True, text=True)
             self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -235,6 +241,8 @@ class TestDurableHumanGate(unittest.TestCase):
             self.assertTrue(state["human_approval"]["approved"])
             self.assertEqual(state["human_approval"]["actor"], "cli")
             self.assertEqual(len(state["human_approval"]["spec_hash"]), 64)
+            self.assertNotIn("max_wall_minutes agotado", resumed.stdout)
+            self.assertEqual(state["original_started_at"], 1)
             self.assertTrue(any(
                 event.get("event") == "APROBADO"
                 and event.get("nodo") == "human_gate"
@@ -244,7 +252,7 @@ class TestDurableHumanGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wd = git_repo(Path(tmp))
             proc = subprocess.run(
-                [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd),
+                [PY, "-m", "sdd.runtime.orchestrator", "--workdir", str(wd),
                  "--simulate", "--autonomous"],
                 capture_output=True, text=True,
                 env={**os.environ, "SDD_FAKE_PARALLEL": "1"})

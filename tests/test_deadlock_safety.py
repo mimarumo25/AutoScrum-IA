@@ -11,12 +11,10 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
-import optimized_gates  # noqa: E402
-import cli  # noqa: E402
-import orchestrator  # noqa: E402
-import process_control  # noqa: E402
-import run_lease  # noqa: E402
-import server  # noqa: E402
+from sdd import server
+from sdd.core import process_control, run_lease
+from sdd.presentation import cli
+from sdd.runtime import optimized_gates, orchestrator
 
 
 class TestRunLease(unittest.TestCase):
@@ -34,7 +32,7 @@ class TestRunLease(unittest.TestCase):
     def test_orquestador_con_lease_ocupado_no_toca_el_estado(self):
         with tempfile.TemporaryDirectory() as tmp, run_lease.acquire(tmp, 0):
             result = subprocess.run(
-                [sys.executable, str(ROOT / "orchestrator.py"),
+                [sys.executable, "-m", "sdd.runtime.orchestrator",
                  "--workdir", tmp, "--simulate", "--autonomous"],
                 capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 2)

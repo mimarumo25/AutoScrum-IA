@@ -15,11 +15,14 @@ Las tres cosas que la corrida real hizo mal y que aqui quedan clavadas:
 import argparse
 import contextlib
 import io
+import json
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
+from unittest.mock import patch
 from http.client import IncompleteRead
 from pathlib import Path
 
@@ -27,9 +30,8 @@ ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "gates"))
 
-import orchestrator  # noqa: E402
-import providers  # noqa: E402
-import taskqueue  # noqa: E402
+from sdd.integrations import providers
+from sdd.runtime import orchestrator, taskqueue
 
 PY = sys.executable
 CFG = tomllib.loads((ROOT / "pipeline.toml").read_text(encoding="utf-8"))
@@ -113,11 +115,21 @@ class TestHonestidadDelOrquestador(OrchestratorCase):
         self.assertEqual(defectos[0]["regla"], "agente-fallido")
         self.assertIn("IncompleteRead", defectos[0]["evidencia"])
 
-    def test_agente_caido_agota_reintentos_y_escala(self):
+    def test_agente_caido_sube_modelo_y_luego_escala(self):
+        # El escalado de modelo concede UN intento extra, no un presupuesto nuevo:
+        # reiniciar attempts convertia max_retries_per_gate en el doble sin tocar
+        # pipeline.toml. Y al no converger el estado es 'escalated' (codigo 1), no
+        # 'waiting_human', que es la pausa firmada del gate humano y sale con 0.
         self.fake_agent(1, "boom")
         for _ in range(CFG["budget"]["max_retries_per_gate"] + 1):
             self.step()
+        self.assertEqual(self.state["status"], "running")
+        self.assertTrue(self.events("MODEL_ESCALATION"))
+
+        # Un solo paso mas basta: el contador de reintentos sigue agotado.
+        self.step()
         self.assertEqual(self.state["status"], "escalated")
+        self.assertTrue(self.events("RECUPERACION_EN_ESPERA"))
         self.assertTrue(self.events("ESCALATE_HUMAN"))
 
     def test_agente_bloqueado_se_distingue_del_agente_roto(self):
@@ -141,7 +153,9 @@ class TestHonestidadDelOrquestador(OrchestratorCase):
                 "Caracteristica: x\n\n  @FR-001 @SCN-001 @p1\n  Escenario: ok\n"
                 "    Dado algo\n    Cuando pasa\n    Entonces resulta\n",
         })
-        self.step()
+        # Esta prueba cubre approve/commit; el contrato de R1 vive en test_revisor.py.
+        with patch.object(orchestrator, "run_node_gates", return_value=[]):
+            self.step()
         aprobado = self.events("APROBADO")
         self.assertEqual(aprobado[0]["accion"], "commit")
         self.assertEqual(self.state["cursor"], "architect")
@@ -211,6 +225,119 @@ class TestColaDeTareas(unittest.TestCase):
         taskqueue.mark_done(t, d["id"])
         self.assertEqual(qa["status"], "pending")
         self.assertEqual(taskqueue.next_runnable(t)["id"], "T-002")
+
+    def test_una_rama_en_espera_no_detiene_tareas_independientes(self):
+        tasks = self.tasks() + [{
+            "id": "T-003", "node": "dev_frontend", "title": "interfaz",
+            "fr_refs": [], "deliverables": [], "depends_on": [],
+            "acceptance": "", "scope": "", "kind": "plan", "status": "pending",
+        }]
+        taskqueue.mark_needs_input(tasks, "T-001", "falta una decision", "G4")
+
+        self.assertEqual(taskqueue.next_runnable(tasks)["id"], "T-003")
+        self.assertEqual(taskqueue.by_id(tasks, "T-002")["status"], "pending")
+        self.assertEqual(taskqueue.by_id(tasks, "T-001")["status"], "needs_input")
+
+    def test_sin_ramas_ejecutables_escala_sin_fingir_exito(self):
+        # Ninguna rama puede avanzar y quedan tareas sin cerrar: es interbloqueo, no
+        # pausa. Debe salir con codigo != 0; 'waiting_human' devolveria 0 y una corrida
+        # atascada se reportaria como completada.
+        tasks = self.tasks()
+        taskqueue.mark_needs_input(tasks, "T-001", "requiere dato")
+        state = {"tasks": tasks, "status": "running", "current_task": None}
+        events = []
+
+        target = orchestrator.enter_task_loop(
+            state, ".", lambda _state, event, **fields: events.append((event, fields)))
+
+        self.assertIsNone(target)
+        self.assertEqual(state["status"], "escalated")
+        self.assertIn("RAMAS_EN_ESPERA", [event for event, _ in events])
+        self.assertEqual(events[-1][0], "ESCALATE_HUMAN")
+
+    def test_fallo_lineal_vuelve_al_agente_anterior_y_reanuda_al_dependiente(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = {"attempts": {}, "status": "running", "cursor": "architect",
+                     "defect_seq": 0, "tasks": [], "recoveries": [],
+                     "recovery_seq": 0, "resume_stack": []}
+            finding = [{"file": "spec/10_product/prd.md", "line": 8,
+                        "rule": "criterio-ausente", "evidence": "falta criterio"}]
+            events = []
+            emit = lambda _state, event, **fields: events.append((event, fields))
+
+            orchestrator.handle_defect(
+                state, tmp, {"id": "architect"}, None, "product", "G2",
+                finding, {"max_retries_per_gate": 2, "max_defect_tasks": 12}, emit)
+
+            self.assertEqual(state["cursor"], "product")
+            self.assertEqual(state["status"], "running")
+            self.assertEqual(state["recoveries"][0]["failed_node"], "architect")
+            self.assertEqual(state["recoveries"][0]["owner"], "product")
+            current = json.loads((Path(tmp) / ".agent/current_task.json").read_text())
+            self.assertEqual(current["kind"], "defect")
+            self.assertIn("falta criterio", current["findings"][0]["evidence"])
+
+            with mock.patch.object(orchestrator, "commit", return_value=(True, "ok")):
+                orchestrator.approve(
+                    state, tmp, {"id": "product", "next": "architect", "writes": []},
+                    None, emit)
+
+            self.assertEqual(state["cursor"], "architect")
+            self.assertEqual(state["recoveries"][0]["status"], "corrected")
+            self.assertIn("CORRECCION_RECIBIDA", [event for event, _ in events])
+
+    def test_agotar_reintentos_lineales_sube_modelo_antes_de_pedir_ayuda(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(orchestrator.config, "load", return_value={
+                    "routing": {"max_frontier_escalations_per_task": 1}}):
+            state = {"attempts": {"architect:G2": 2}, "status": "running",
+                     "cursor": "architect", "defect_seq": 0, "tasks": [],
+                     "recoveries": [], "recovery_seq": 0, "resume_stack": []}
+            finding = [{"file": "spec/20_arch/nfr.yaml", "line": 1,
+                        "rule": "nfr-no-medible", "evidence": "falta metrica"}]
+            emit = lambda *_args, **_kwargs: None
+            budget = {"max_retries_per_gate": 2, "max_defect_tasks": 12}
+
+            orchestrator.handle_defect(
+                state, tmp, {"id": "architect"}, None, "architect", "G2",
+                finding, budget, emit)
+
+            self.assertEqual(state["status"], "running")
+            self.assertTrue(state["recoveries"][0]["model_escalated"])
+            # El escalado NO reinicia el contador de reintentos: hacerlo relajaria
+            # max_retries_per_gate sin tocar pipeline.toml. El intento en el que se
+            # escala ya esta consumido.
+            self.assertEqual(state["attempts"]["architect:G2"], 3)
+
+            state["attempts"]["architect:G2"] = 2
+            orchestrator.handle_defect(
+                state, tmp, {"id": "architect"}, None, "architect", "G2",
+                finding, budget, emit)
+            # Agotado el unico escalado permitido: escalated (codigo 1), no la pausa
+            # firmada waiting_human (codigo 0).
+            self.assertEqual(state["status"], "escalated")
+            self.assertEqual(state["recoveries"][0]["status"], "needs_input")
+
+    def test_reintentos_de_tarea_crean_correccion_sin_escalar_proyecto(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = {"id": "T-100", "node": "dev_backend", "title": "api",
+                    "status": "pending", "kind": "plan", "fr_refs": [],
+                    "deliverables": [], "depends_on": [], "acceptance": "", "scope": ""}
+            state = {"attempts": {"T-100:G4": 2}, "status": "running",
+                     "cursor": "dev_backend", "defect_seq": 0, "tasks": [task]}
+            finding = [{"file": "src/api/a.py", "line": 2,
+                        "rule": "lint", "evidence": "fallo"}]
+
+            orchestrator.handle_defect(
+                state, tmp, {"id": "dev_backend"}, task, "dev_backend", "G4",
+                finding, {"max_retries_per_gate": 2, "max_defect_tasks": 12},
+                lambda *_args, **_kwargs: None)
+
+            self.assertEqual(state["status"], "running")
+            self.assertEqual(task["status"], "blocked")
+            self.assertEqual(task["blocked_by"], "D-001")
+            self.assertEqual(taskqueue.by_id(state["tasks"], "D-001")["node"],
+                             "dev_backend")
 
     def test_defectos_encadenados_se_cierran_sin_reactivar_trabajo_obsoleto(self):
         t = self.tasks()
@@ -336,7 +463,7 @@ class TestCorridaCompleta(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wd = git_repo(Path(tmp))
             proc = subprocess.run(
-                [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd),
+                [PY, "-m", "sdd.runtime.orchestrator", "--workdir", str(wd),
                  "--simulate", "--autonomous"], capture_output=True, text=True)
             salida = proc.stdout + proc.stderr
             self.assertEqual(proc.returncode, 0, salida[-3000:])
@@ -355,7 +482,7 @@ class TestCorridaCompleta(unittest.TestCase):
         # forma de continuar la corrida.
         with tempfile.TemporaryDirectory() as tmp:
             wd = git_repo(Path(tmp))
-            base = [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd), "--simulate"]
+            base = [PY, "-m", "sdd.runtime.orchestrator", "--workdir", str(wd), "--simulate"]
 
             parada = subprocess.run(base, capture_output=True, text=True)
             self.assertIn("estado final: waiting_human", parada.stdout)
@@ -382,7 +509,7 @@ class TestReanudar(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wd = git_repo(Path(tmp))
             proc = subprocess.run(
-                [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd), "--resume"],
+                [PY, "-m", "sdd.runtime.orchestrator", "--workdir", str(wd), "--resume"],
                 capture_output=True, text=True)
             self.assertEqual(proc.returncode, 1)
             self.assertIn("no hay corrida que reanudar", proc.stdout)
@@ -404,6 +531,79 @@ class TestReanudar(unittest.TestCase):
         self.assertIsNone(state["parallel_batch"])
         self.assertEqual(state["parallel_results"], {})
         self.assertIsNone(state["current_task"])
+        self.assertEqual(state["resume_checkpoint"]["from_node"], "parallel_dispatch")
+        self.assertEqual(state["resume_history"][-1]["attempts"], {"T-003:G9": 3})
+
+    def test_resume_lineal_conserva_el_nodo_exacto_que_fallo(self):
+        state = {
+            "status": "escalated", "cursor": "architect",
+            "attempts": {"architect:G2": 3}, "current_task": None,
+        }
+
+        previous = orchestrator.prepare_resume(state)
+
+        self.assertEqual(previous, "escalated")
+        self.assertEqual(state["cursor"], "architect")
+        self.assertEqual(state["resume_checkpoint"]["from_node"], "architect")
+        self.assertEqual(state["resume_history"][-1]["attempts"],
+                         {"architect:G2": 3})
+        self.assertEqual(state["attempts"], {})
+
+    def test_resume_antiguo_reconstruye_y_publica_la_correccion_del_arquitecto(self):
+        findings = [
+            "NFR-USAB-01 sin campo metrica",
+            "NFR-USAB-02 sin campo metrica",
+            "NFR-SEC-01 sin campo metrica",
+            "NFR-SEC-02 sin campo metrica",
+            "NFR-SEC-03 sin campo metrica",
+        ]
+        state = {
+            "status": "escalated", "cursor": "architect", "started_at": 1,
+            "attempts": {"architect:G2": 3}, "current_task": None, "tasks": [],
+            "history": [
+                *[{"event": "DEFECTO", "gate": "G2", "owner": "architect",
+                   "ubicacion": "spec/20_arch/nfr.yaml:0",
+                   "regla": "nfr-no-medible", "evidencia": item}
+                  for item in findings],
+                {"event": "ESCALATE_HUMAN",
+                 "motivo": "architect:G2 fallo 3 veces"},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            orchestrator.prepare_resume(state, tmp)
+            published = json.loads(
+                (Path(tmp) / ".agent/current_task.json").read_text(encoding="utf-8"))
+
+        self.assertGreater(state["started_at"], 1)
+        self.assertEqual(state["original_started_at"], 1)
+        self.assertEqual(state["resume_recovery"]["owner"], "architect")
+        self.assertEqual(state["resume_recovery"]["findings"], 5)
+        self.assertEqual(state["recoveries"][0]["status"], "assigned")
+        self.assertTrue(state["recoveries"][0]["model_escalated"])
+        self.assertEqual(published["node"], "architect")
+        self.assertEqual(published["kind"], "defect")
+        self.assertEqual(len(published["findings"]), 5)
+
+    def test_save_reintenta_colision_temporal_de_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".agent/state.json"
+            original_replace = Path.replace
+            calls = []
+
+            def flaky_replace(source, target):
+                calls.append(str(source))
+                if len(calls) < 3:
+                    raise PermissionError("archivo ocupado")
+                return original_replace(source, target)
+
+            with patch.object(Path, "replace", flaky_replace), \
+                    patch.object(orchestrator.time, "sleep"):
+                orchestrator.save({"status": "running"}, path)
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["status"], "running")
+            self.assertFalse(list(path.parent.glob(".state.json.*.tmp")))
 
     def test_resume_running_rancio_en_dispatch_vuelve_al_scheduler(self):
         state = {
@@ -422,10 +622,12 @@ class TestReanudar(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             wd = git_repo(Path(tmp))
             env_stuck = {**_os.environ, "SDD_FAKE_STUCK": "1"}
-            base = [PY, str(ROOT / "orchestrator.py"), "--workdir", str(wd),
+            base = [PY, "-m", "sdd.runtime.orchestrator", "--workdir", str(wd),
                     "--simulate", "--autonomous"]
-            # 1) Corrida que escala: el agente de product nunca corrige.
+            # 1) Corrida que espera ayuda: product no logra corregir por si solo.
             esc = subprocess.run(base, capture_output=True, text=True, env=env_stuck)
+            # No convergio: escalated (codigo 1). waiting_human se reserva para la
+            # pausa firmada del gate humano, que sale con codigo 0.
             self.assertIn("estado final: escalated", esc.stdout)
             commits_antes = subprocess.run(
                 ["git", "-C", str(wd), "rev-list", "--count", "HEAD"],
@@ -437,10 +639,23 @@ class TestReanudar(unittest.TestCase):
             self.assertIn("en estado 'escalated'", rej.stdout)
 
             # 3) Con --resume y ya sin el fallo, continua y completa; el historial
-            #    (commits) previo se conserva, no se reinicia.
+            #    (commits) previo se conserva, no se reinicia. Además emulamos
+            #    un checkpoint anterior a la lógica de recuperaciones: debe
+            #    reconstruir la tarea y no caducar por la fecha de la corrida.
+            state_path = wd / ".agent/state.json"
+            old_state = json.loads(state_path.read_text(encoding="utf-8"))
+            old_state["started_at"] = 1
+            old_state.pop("recoveries", None)
+            old_state.pop("recovery_seq", None)
+            old_state.pop("resume_stack", None)
+            state_path.write_text(json.dumps(old_state), encoding="utf-8")
+            current_task = wd / ".agent/current_task.json"
+            current_task.unlink(missing_ok=True)
             ok = subprocess.run(base + ["--resume"], capture_output=True, text=True)
             self.assertEqual(ok.returncode, 0, (ok.stdout + ok.stderr)[-2000:])
             self.assertIn("REANUDADO", ok.stdout)
+            self.assertIn("RECUPERACION_RESTAURADA", ok.stdout)
+            self.assertNotIn("max_wall_minutes agotado", ok.stdout)
             self.assertIn("estado final: done", ok.stdout)
             self.assertIn("tareas: 5/5", ok.stdout)
             commits_despues = subprocess.run(

@@ -10,7 +10,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
-import optimized_gates  # noqa: E402
+from sdd.runtime import optimized_gates
 
 
 def pipeline():

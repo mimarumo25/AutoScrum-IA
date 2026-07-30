@@ -87,7 +87,7 @@ def analyze(tasks: list[dict[str, object]]) -> dict[str, object]:
 
 def log_plan(workdir: str, state: dict[str, object], log_fn) -> None:
     """Publica el analisis antes del gate humano; nunca cambia el plan."""
-    import taskqueue
+    from sdd.runtime import taskqueue
     try:
         result = analyze(taskqueue.load_plan(workdir))
     except taskqueue.PlanError:

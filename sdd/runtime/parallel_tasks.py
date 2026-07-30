@@ -4,18 +4,13 @@ import os
 
 from langgraph.types import Send
 
-import scrum
-import metrics
-import plan_analysis
-import task_worktrees
-import taskqueue
-import lifecycle
-import chronicle
+from sdd.core import chronicle, lifecycle, metrics
+from sdd.runtime import plan_analysis, scrum, task_worktrees, taskqueue
 
 
 def _scrum_complete(system: str, user: str, workdir: str) -> str:
     """Usa opcionalmente un modelo rapido sin contaminar llamadas posteriores."""
-    import providers
+    from sdd.integrations import providers
     keys = ("SDD_MODEL", "SDD_METRICS_OPERATION", "SDD_METRICS_NODE",
             "SDD_METRICS_TASK", "SDD_METRICS_WORKDIR")
     previous = {key: os.environ.get(key) for key in keys}
@@ -77,11 +72,16 @@ class ParallelTasks:
                 current["status"] = "done"
                 taskqueue.clear_current(self.workdir)
             else:
+                # Interbloqueo del sprint, no pausa: 'waiting_human' devolveria 0 y
+                # reportaria como exito una corrida que no puede avanzar.
                 current["status"] = "escalated"
+                taskqueue.clear_current(self.workdir)
                 blocked = ", ".join(
                     f"{task['id']}({task['status']})" for task in pending[:6])
-                self.log_fn(current, "ESCALATE_HUMAN",
-                            motivo=f"ninguna tarea ejecutable: {blocked}")
+                self.log_fn(current, "RAMAS_EN_ESPERA", pendientes=len(pending),
+                            motivo=f"no hay tareas ejecutables; esperan correcciones: {blocked}")
+                self.log_fn(current, "ESCALATE_HUMAN", pendientes=len(pending),
+                            motivo="ninguna rama puede avanzar sin intervencion")
             self.project(current)
             return current
 
@@ -122,11 +122,15 @@ class ParallelTasks:
     def dispatch(self, value):
         batch = value.get("parallel_batch") or {}
         batch_id = str(batch.get("id", ""))
+        task_ids = list(batch.get("task_ids", []))
+        # 'size' viaja con cada worker porque cada rama solo ve su propia tarea y sin
+        # ese dato no puede repartirse el presupuesto global de llamadas.
         return [Send("parallel_worker", {
             **copy.deepcopy(dict(value)),
             "worker_task_id": task_id,
-            "parallel_batch": {"id": batch_id, "task_ids": [task_id]},
-        }) for task_id in batch.get("task_ids", [])]
+            "parallel_batch": {"id": batch_id, "task_ids": [task_id],
+                               "size": len(task_ids)},
+        }) for task_id in task_ids]
 
     def worker(self, value):
         parent = self.normalize(copy.deepcopy(dict(value)))
@@ -140,8 +144,21 @@ class ParallelTasks:
         if not isinstance(workspace, dict):
             raise RuntimeError(f"{task_id}: worktree no preparado")
 
+        # El techo max_agent_calls vive en step(), que lo compara contra el contador
+        # del estado que recibe. Con el contador local en 0 el techo global no existia
+        # dentro del sprint: cada worker podia gastar el presupuesto completo, y una
+        # ola de 6 multiplicaba por 6 el gasto autorizado. Cada worker recibe ahora su
+        # parte del presupuesto restante, sembrando el contador para que step() corte
+        # en el punto correcto. El resultado reporta el delta, no el absoluto, para que
+        # collect siga acumulando bien.
+        ceiling = int(self.cfg["budget"]["max_agent_calls"])
+        siblings = max(1, int((parent.get("parallel_batch") or {}).get("size", 1)))
+        remaining = max(0, ceiling - int(parent.get("agent_calls", 0)))
+        share = max(1, remaining // siblings)
+        baseline = max(0, ceiling - share)
+
         local = copy.deepcopy(parent)
-        local.update(tasks=[task], history=[], attempts={}, agent_calls=0,
+        local.update(tasks=[task], history=[], attempts={}, agent_calls=baseline,
                      defect_seq=0, current_task=task_id,
                      cursor=str(task["node"]), status="running")
         worker_args = copy.copy(self.args)
@@ -150,18 +167,30 @@ class ParallelTasks:
         lifecycle.started(self.workdir, task_id, str(task["node"]),
                           workspace=str(workspace["path"]), batch_id=batch_id)
 
-        while local["status"] == "running":
-            active = taskqueue.by_id(local["tasks"], task_id)
-            if active is None or active["status"] == "done":
-                break
-            if any(item.get("kind") == "defect" for item in local["tasks"]
-                   if item.get("id") != task_id):
-                break
-            if local["cursor"] == "task_loop":
-                break
-            setattr(worker_args, "visit_id",
-                    f"{batch_id}-{task_id}-{local['agent_calls']}")
-            self.step_fn(local, worker_args, self.cfg, self.nodes, self.auto_human)
+        # Una excepcion inesperada aqui abortaba el nodo del grafo y con el toda la
+        # ola: las tareas hermanas que ya habian terminado perdian su resultado y
+        # collect fallaba con 'resultado de worker ausente'. Una tarea que revienta
+        # debe degradar a escalated y dejar que el colector la trate, no tumbar el lote.
+        crash = ""
+        try:
+            while local["status"] == "running":
+                active = taskqueue.by_id(local["tasks"], task_id)
+                if active is None or active["status"] == "done":
+                    break
+                if any(item.get("kind") == "defect" for item in local["tasks"]
+                       if item.get("id") != task_id):
+                    break
+                if local["cursor"] == "task_loop":
+                    break
+                setattr(worker_args, "visit_id",
+                        f"{batch_id}-{task_id}-{local['agent_calls']}")
+                self.step_fn(local, worker_args, self.cfg, self.nodes, self.auto_human)
+        except Exception as error:  # noqa: BLE001 — se reporta como resultado, no se traga
+            crash = f"{type(error).__name__}: {error}"[:300]
+            local["status"] = "escalated"
+            lifecycle.blocked(self.workdir, task_id, "worker-crash", "G-WORKER",
+                              [{"file": f"agents/{task['node']}.md", "line": 0,
+                                "rule": "worker-excepcion", "evidence": crash}])
 
         active = taskqueue.by_id(local["tasks"], task_id) or task
         node = self.nodes[str(active["node"])]
@@ -180,8 +209,11 @@ class ParallelTasks:
         result = {
             "batch_id": batch_id, "task_id": task_id, "outcome": outcome,
             "task": active, "defect": defect, "history": local["history"],
-            "attempts": local["attempts"], "agent_calls": local["agent_calls"],
-            "status": local["status"],
+            "attempts": local["attempts"],
+            # Delta, no absoluto: el contador se sembro en 'baseline' para que step()
+            # cortara en el techo global, asi que el gasto real es la diferencia.
+            "agent_calls": max(0, int(local["agent_calls"]) - baseline),
+            "status": local["status"], "crash": crash,
         }
         return {"parallel_results": {f"{batch_id}:{task_id}": result}}
 
@@ -222,14 +254,23 @@ class ParallelTasks:
                 self.workdir, task, [str(path) for path in node.get("writes", [])],
                 taskqueue.commit_message(str(task["node"]), task), self.commit_fn)
             if status == "error":
-                current["status"] = "escalated"
-                self.log_fn(current, "ESCALATE_HUMAN", motivo=detail)
-                return False
+                taskqueue.mark_needs_input(
+                    current["tasks"], task_id,
+                    f"no se pudo integrar la correccion: {detail}", "integration")
+                self.log_fn(current, "RAMA_EN_ESPERA", tarea=task_id,
+                            nodo=task.get("node", ""), gate="integration",
+                            motivo=detail)
+                task_worktrees.cleanup(self.workdir, task)
+                return True
             lifecycle.integrated(self.workdir, task_id, status, detail)
             done_before = {
                 str(item["id"]) for item in current["tasks"]
                 if item.get("status") == "done"
             }
+            waiting_before = [
+                str(item["id"]) for item in current["tasks"]
+                if item.get("blocked_by") == task_id
+            ]
             taskqueue.mark_done(current["tasks"], task_id, self.workdir)
             completed = [
                 item for item in current["tasks"]
@@ -241,17 +282,25 @@ class ParallelTasks:
             self.log_fn(current, "INTEGRADO", tarea=task_id,
                         accion="commit" if status == "committed" else "sin-commit",
                         detalle=detail)
+            for waiting_id in waiting_before:
+                waiting = taskqueue.by_id(current["tasks"], waiting_id)
+                if waiting is not None and waiting.get("status") == "pending":
+                    self.log_fn(current, "CORRECCION_RECIBIDA", de=task_id,
+                                reanuda=waiting_id)
             return True
         if result["outcome"] == "blocked":
             defect = result.get("defect") or {}
             limit = int(self.cfg["budget"].get("max_defect_tasks", 12))
             if current["defect_seq"] >= limit:
-                current["status"] = "escalated"
-                self.log_fn(
-                    current, "ESCALATE_HUMAN",
-                    motivo=f"tope de tareas de defecto alcanzado ({limit})")
+                reason = f"la rama alcanzo el tope de {limit} correcciones"
+                taskqueue.mark_needs_input(
+                    current["tasks"], task_id, reason,
+                    str(defect.get("gate_id", "")))
+                self.log_fn(current, "RAMA_EN_ESPERA", tarea=task_id,
+                            nodo=task.get("node", ""),
+                            gate=str(defect.get("gate_id", "")), motivo=reason)
                 task_worktrees.cleanup(self.workdir, task)
-                return False
+                return True
             current["defect_seq"] += 1
             created = taskqueue.make_defect(
                 current["tasks"], str(defect.get("node")),
@@ -271,7 +320,11 @@ class ParallelTasks:
                               str(created.get("gate_id", "")),
                               defect.get("findings", []))
             return True
-        current["status"] = "escalated"
-        self.log_fn(current, "ESCALATE_HUMAN",
-                    motivo=f"worker {task_id} no pudo converger")
-        return False
+        crash = str(result.get("crash") or "")
+        reason = (f"la tarea {task_id} aborto con una excepcion: {crash}" if crash
+                  else f"la tarea {task_id} no pudo converger de forma automatica")
+        taskqueue.mark_needs_input(current["tasks"], task_id, reason)
+        self.log_fn(current, "RAMA_EN_ESPERA", tarea=task_id,
+                    nodo=task.get("node", ""), motivo=reason)
+        task_worktrees.cleanup(self.workdir, task)
+        return True

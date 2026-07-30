@@ -1,236 +1,419 @@
-# Pipeline SDD multi-agente — LangGraph v0.3
+# AutoScrum · SDD Multi-Agent Control Tower
 
-Plano de control primero: los gates y la propiedad de paths son lo que hace utilizable
-un pipeline de agentes. El orquestador es la pieza barata.
+AutoScrum es una aplicación local que convierte un objetivo de producto en una ejecución de ingeniería trazable. Combina un pipeline SDD multiagente sobre LangGraph, gates deterministas, aislamiento Git por tarea, persistencia local y un panel web de observabilidad en tiempo real.
 
-## Que hay aqui
+La aplicación se distribuye como un único paquete Python y puede operarse desde la CLI o desde el **Control Tower** web.
 
-| Archivo | Rol |
+> Versión del paquete: `0.3.1` · Python `>= 3.11`
+
+## Estado actual
+
+| Área | Estado |
 |---|---|
-| `pipeline.toml` | grafo, propiedad de paths, entregables exigidos, presupuesto |
-| `graph_runtime.py` | StateGraph asíncrono, checkpoints SQLite e interrupt humano |
-| `orchestrator.py` | supervisor y reglas de dominio (router puro, sin juicio) |
-| `taskqueue.py` | la cola del sprint: dependencias, bloqueos y tareas de defecto |
-| `parallel_tasks.py` | scheduler, Send workers y colector de resultados |
-| `scrum.py` / `plan_analysis.py` | prioridad de la ola y análisis de camino crítico |
-| `task_worktrees.py` | aislamiento e integracion Git por tarea |
-| `optimized_gates.py` | ejecución concurrente y caché segura de revisiones R1/R2 |
-| `metrics.py` | tiempos, llamadas y uso de tokens en JSONL |
-| `gates/registry.toml` | registro declarativo de gates y su enrutamiento |
-| `gates/check_*.py` | checkers deterministas (`G*`) + la revision critica (`R1`) |
-| `agents/*.md` | los seis system prompts + el del revisor |
-| `examples/fake_agent.py` | agente simulado, para probar el bucle sin tokens |
+| Pipeline `product → architect → planner → human_gate` | Operativo |
+| Sprint paralelo `dev_backend`, `dev_frontend` y `qa` | Operativo |
+| Checkpoints LangGraph en SQLite y reanudación | Operativo |
+| Gates deterministas `G*` y revisión crítica `R1/R2` | Operativo |
+| Worktrees Git por tarea e integración determinista | Operativo |
+| Control Tower con actualización SSE | Operativo |
+| Historial, artefactos, logs y trazas por tarea | Operativo |
+| Configuración de proveedor y perfiles por agente | Operativo |
+| Routing adaptativo, discovery y escalado por tarea | Operativo |
+| Agentes personalizados | Catálogo y persistencia; incorporación automática al grafo pendiente |
+| Vista de memoria | Preparada; el runtime aún no emite eventos de memoria |
+| Ejecución horizontal multiproceso | No soportada; la persistencia actual es local |
 
-## Como corre: dos fases
+## Capacidades principales
 
-**Fase lineal** — `product → architect → planner → gate humano`. Produce la
-especificacion y, sobre todo, `spec/30_plan/tasks.yaml`: el corte del sistema en
-tareas con dueno, entregables, dependencias y criterio de aceptacion.
+- **Objetivos ricos:** la nueva ejecución usa un compositor de pantalla completa con títulos, negrita, cursiva, listas, enlaces y contador. El contenido se normaliza a texto compatible con Markdown antes del run.
+- **Historia por iteración:** objetivo, orquestación, subtareas, gates, bloqueos, resultado y artefactos forman un hilo navegable.
+- **Observabilidad multiagente:** una matriz animada muestra agentes en espera, pensando, ejecutando, transmitiendo, completados o en error.
+- **Click-to-inspect:** cada agente o tarea abre un drawer con resumen, lifecycle, logs filtrables, I/O y memoria.
+- **Tiempo real:** el navegador recibe snapshots mediante Server-Sent Events (`/events`) y usa polling como fallback.
+- **Configuración modular:** `Configuración → Agentes` permite activar agentes, elegir proveedor/modelo, ajustar temperatura y tokens, editar instrucciones y seleccionar herramientas.
+- **Persistencia auditable:** checkpoints, estado, métricas, tokens, lifecycle, chronicle y logs viven dentro de cada ejecución.
+- **Fail-fast:** credenciales ausentes, agentes deshabilitados, timeouts o conflictos de lease producen un estado explícito.
 
-**Sprint de tareas** — LangGraph despacha las tareas con dependencias cerradas.
-Las que no comparten entregables corren en una ola maximal, hasta
-`runtime.max_concurrency`, cada una dentro de su propio Git worktree. Cuando hay
-más candidatas que cupos, el supervisor Scrum prioriza defectos, camino crítico y
-tareas que desbloquean más trabajo; el colector integra sus deltas en orden
-determinista. Cada tarea es
-una llamada acotada a un agente, sus gates y su propio commit. Un
-defecto que pertenece a otro nodo no es un reintento a ciegas: se convierte en una
-tarea `D-###` para su dueno, y la tarea que lo destapo queda bloqueada hasta que
-cierre. Eso es lo que hace que el sistema se comporte como un equipo y no como una
-cadena de montaje de una sola pieza.
+## Arquitectura
 
-### Reglas de honestidad
+```mermaid
+flowchart LR
+    U["Objetivo del usuario"] --> I["Intake"]
+    I --> P["Product"]
+    P --> A["Architect"]
+    A --> PL["Planner"]
+    PL --> H{"Gate humano"}
+    H --> S["Sprint / Scrum scheduler"]
+    S --> BE["Backend"]
+    S --> FE["Frontend"]
+    S --> QA["QA"]
+    BE --> G["Gates G* + R2"]
+    FE --> G
+    QA --> G
+    G --> S
+    S --> R["Resultado y artefactos"]
 
-El pipeline no puede reportar un exito que no ocurrio:
+    RT["LangGraph + SQLite"] -. checkpoints .-> P
+    RT -. checkpoints .-> S
+    O["Lifecycle · Chronicle · Metrics · Logs"] -. observa .-> S
+    O --> SSE["Servidor local + SSE"]
+    SSE --> UI["Control Tower"]
+```
 
-- un agente que sale con codigo != 0 **no avanza** — se contabiliza como defecto
-  del nodo, se reintenta y, agotado el presupuesto, se escala;
-- **G0** exige que cada nodo deje escritos los entregables que declaro. Sin el, un
-  agente que muere sin escribir nada pasa todos los gates: no hay artefacto que
-  reprobar;
-- **G9** ejecuta de verdad la suite del proyecto con los comandos de
-  `spec/20_arch/toolchain.yaml`. Mientras ningun gate ejecute, el verde no
-  significa nada;
-- cada commit contiene solo lo que su nodo posee, y si no hubo commit el reporte
-  lo dice.
+### Fase de especificación
 
-### Dos categorias de verificacion
+1. `product` produce el PRD y escenarios funcionales.
+2. `architect` define NFR, API, entorno, amenazas y toolchain.
+3. `planner` crea `spec/30_plan/tasks.yaml`.
+4. `human_gate` interrumpe el grafo hasta recibir aprobación.
 
-`G*` es **codigo determinista sin juicio**: su veredicto no se discute. `R1` es el
-**revisor critico** — un modelo leyendo el trabajo de otro modelo despues de
-`product`, `architect` y `planner`, para lo que la forma no alcanza: un PRD puede
-pasar G1 entero y seguir siendo inservible.
+### Sprint de tareas
 
-R1 solo puede **anadir** defectos, nunca relajar un `G*`, y esta acotado para que
-el ciclo converja: corre al final y solo si los deterministas estan verdes; solo
-los hallazgos `blocking` frenan (los `mejora` van al backlog del reporte); tope de
-2 rondas por nodo, y solo la ronda que bloquea consume presupuesto. Si el revisor
-se cae, el gate pasa y lo registra — los deterministas siguen sosteniendo la
-correccion. Con `SDD_REVIEW_MODEL` corre en otro modelo que el autor.
+El scheduler selecciona tareas con dependencias cerradas y entregables sin solapamiento. Ejecuta hasta `runtime.max_concurrency` tareas simultáneas, cada una en su Git worktree. Scrum prioriza defectos, camino crítico y trabajo que desbloquea otras tareas; el colector integra los deltas en orden determinista.
 
-## Un solo comando: `sdd`
+Un defecto perteneciente a otro nodo se convierte en una tarea `D-###`; la tarea que lo detectó permanece bloqueada hasta que el dueño lo cierre.
 
-Es **una sola aplicación** (paquete `sdd/`) con **un único comando** que sirve para
-todo — CLI y panel web. Instálala una vez y úsala:
+### Reglas de integridad
 
-    pip install -e .          # deja disponible el comando `sdd` (Python >= 3.11 + git)
+- Un agente con código de salida distinto de cero no avanza.
+- `G0` exige los entregables declarados.
+- `G7` revierte cambios fuera de la propiedad de paths.
+- `G9` ejecuta el toolchain real del proyecto.
+- Los gates `G*` son deterministas; `R1/R2` solo añaden hallazgos.
+- Cada tarea tiene presupuesto, timeout, lifecycle y commit propios.
+- Un lease por ejecución evita competencia por SQLite o Git.
 
-    sdd demo                  # bucle simulado completo, 0 tokens
-    sdd web                   # PANEL WEB para operar el pipeline (abre el navegador)
-    sdd run --project mi-app  # corrida real con agentes (necesita API key)
-    sdd doctor                # verifica proveedor / API key
-    sdd config                # muestra la configuración guardada (llaves enmascaradas)
-    sdd show                  # visor de la última corrida (terminal)
-    sdd view                  # reporte HTML de la última corrida
-    sdd test                  # suite de pruebas del plano de control
-    sdd gates --node dev_backend --workdir <repo>
+## Control Tower web
 
-Sin instalar, lo mismo con `python -m sdd <cmd>`. `sdd demo` termina en
-`estado final: done | tareas: 5/5`. El guion no es
-decorativo: construye un proyecto Python real, ejercita una violación de propiedad
-revertida por G7, y planta un defecto de dominio que **solo una prueba ejecutada
-revela** — G9 lo detecta, el supervisor lo atribuye a `src/domain/` y abre una
-tarea de defecto para el backend, que la cierra y desbloquea a QA. No consume tokens.
+```powershell
+sdd web
+```
 
-## Estructura de la aplicación
+Abre `http://127.0.0.1:8770`. Para no abrir el navegador o cambiar el puerto:
 
-    pyproject.toml           empaquetado + comando `sdd`
-    sdd/                      la aplicación (un solo paquete)
-      __main__.py            punto de entrada único (sdd / python -m sdd)
-      cli.py                 dispatcher de subcomandos (CLI)
-      server.py              panel web (stdlib http.server)
-      graph_runtime.py       StateGraph async + SQLite + interrupt humano
-      parallel_tasks.py      scheduler + Send workers + colector
-      scrum.py               prioridad determinista de tareas listas
-      plan_analysis.py       camino crítico, ancho y avisos del DAG
-      task_worktrees.py      worktree, integración y limpieza por tarea
-      optimized_gates.py     gates G* concurrentes + caché R1/R2
-      metrics.py             telemetría local append-only
-      execution_journal.py   idempotencia de visitas externas completadas
-      orchestrator.py        supervisor y reglas deterministas de ruta
-      taskqueue.py           cola de tareas: dependencias, bloqueos, defectos
-      agent.py               agente real (llama al modelo, escribe archivos)
-      providers.py           Anthropic + modelos chinos (compat. OpenAI)
-      config.py              configuración persistente (config.json)
-      report.py              reporte HTML + reporte final de una corrida
-      pipeline.toml          grafo, propiedad de paths, entregables, presupuesto
-      gates/                 registry.toml + check_*.py + _lib.py
-      agents/                los seis system prompts + reviewer.md (*.md)
-      examples/fake_agent.py agente simulado (modo demo)
-      intake.yaml            idea de ejemplo
-    tests/                   suite (sdd test)
+```powershell
+sdd web --no-open --port 8770
+```
 
-Los proyectos generados van por defecto a `project/<nombre>` en la raíz del repo
-(configurable). `config.json` (con las llaves) vive también en la raíz y está en
-`.gitignore`.
+### Navegación
 
-## Modo real: agentes que llaman a un modelo
+- **Vista en vivo:** iteraciones, historia, topología de agentes, subtareas, gates y resultados.
+- **Historial:** proyectos y ejecuciones persistidas.
+- **Resultados:** artefactos generados y visor de contenido.
+- **Configuración:** tabs de General, Proveedores, Agentes, Runtime y Seguridad.
 
-El motor real vive en `sdd/providers.py` (capa de proveedores) y `sdd/agent.py` (el
-nodo que lee la idea, llama al modelo y escribe archivos en sus paths). Soporta:
+### Nueva ejecución
 
-| SDD_PROVIDER | Modelo | Variable de key | Cómo |
-|---|---|---|---|
-| `anthropic` (default) | `claude-opus-5` (o `SDD_MODEL`) | `ANTHROPIC_API_KEY` | SDK oficial |
-| `deepseek` | `deepseek-chat` | `DEEPSEEK_API_KEY` | compat. OpenAI |
-| `qwen` | `qwen-max` | `DASHSCOPE_API_KEY` | compat. OpenAI |
-| `glm` | `glm-4-plus` | `ZHIPUAI_API_KEY` | compat. OpenAI |
-| `kimi` | `moonshot-v1-32k` | `MOONSHOT_API_KEY` | compat. OpenAI |
-| `openai` | `SDD_MODEL` | `SDD_API_KEY` + `SDD_BASE_URL` | cualquier endpoint compat. |
+El modal ocupa el viewport y prioriza el campo **Objetivo del workflow**. El editor admite títulos, énfasis, listas y enlaces. También solicita proyecto, nombre de ejecución, proveedor, modelo y API key, y muestra la ruta de salida.
 
-La forma más simple es el panel: `sdd web`. Desde la CLI, define la key (por
-variable de entorno o guardándola con `sdd config` / el panel) y corre:
+### Estados de agentes
 
-    # PowerShell:
-    $env:ANTHROPIC_API_KEY = "sk-ant-..."      # o DEEPSEEK_API_KEY, etc.
-    sdd doctor                                 # confirma que está listo
-    sdd run --project mi-app                   # → project/mi-app
+| Estado | Significado |
+|---|---|
+| `idle` | disponible |
+| `queued` | esperando dependencias o cupo |
+| `thinking` | procesando contexto o respuesta |
+| `tool` | ejecutando herramienta, gate o API |
+| `streaming` | recibiendo o transmitiendo salida |
+| `completed` | trabajo cerrado |
+| `error` | fallo, gate rojo, bloqueo o escalamiento |
+| `disabled` | excluido por configuración |
 
-Si falta la key, el pipeline **no arranca**: falla rápido con el mensaje correcto
-(sin default silencioso, como manda `CLAUDE.md`). `run` siembra un repo git limpio,
-copia tu idea a `spec/00_intake.yaml`, y corre la máquina de estados con agentes
-reales. Cada nodo escribe artefactos reales; los gates los verifican; el supervisor
-enruta y reintenta; se detiene en el gate humano (nodo `human_gate`). Consúmelo después con
-`sdd show --workdir project/mi-app` o `sdd view --workdir project/mi-app`.
+La interfaz respeta `prefers-reduced-motion`.
 
-Con Anthropic, el prompt estable usa caché efímera por defecto; se puede desactivar
-con `SDD_PROMPT_CACHE=0`. `SDD_REVIEW_MODEL` permite reservar un modelo más rápido
-para R1/R2 y para el desempate Scrum. Toda llamada —incluidas revisiones— registra
-latencia, tokens normales y tokens de caché en `.agent/usage.jsonl`; los tiempos de
-nodos, gates y checkpoints quedan en `.agent/metrics.jsonl`.
+### Inspector de agente
 
-## Contrato de un checker
+- **Resumen:** estado, rol, modelo, tarea activa, progreso y herramientas.
+- **Traza:** eventos append-only, gates, bloqueos, reintentos, llamadas y tokens.
+- **Logs:** auto-scroll, búsqueda, filtro por nivel y copia.
+- **I/O:** prompt base e instrucciones del operador.
+- **Memoria:** reservado para futuros eventos `memory.read` y `memory.write`.
 
-Imprime en stdout `{"findings":[{"file","line","rule","evidence"}]}` y sale con codigo
-1 si hay hallazgos. Nada mas: sin prosa, sin sugerencias de implementacion. Asi puedes
-reemplazar `check_file_size.py` por `eslint --format json` con un adaptador de 10 lineas
-sin tocar el orquestador.
+## Instalación
 
-## Sustituciones para uso real
+Requiere Python 3.11+, Git, las herramientas del proyecto que ejecutará `G9` y una API key para el modo real.
 
-| Gate | Checker actual | Reemplazo en produccion |
+```powershell
+git clone <url-del-repositorio>
+cd auto_scrum
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+```
+
+En Linux/macOS: `source .venv/bin/activate`. También se puede usar `python -m sdd <comando>` sin instalar el script global.
+
+## Inicio rápido
+
+### Demo sin tokens
+
+```powershell
+sdd demo
+```
+
+La demo crea un repositorio, ejecuta agentes simulados y ejercita propiedad de paths, gates, defectos y pruebas reales sin llamar a un LLM.
+
+### Ejecución real desde la UI
+
+```powershell
+sdd web
+```
+
+Configura proveedor y credencial, abre **Nueva ejecución**, redacta el objetivo y observa el workflow.
+
+### Ejecución real desde la CLI
+
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+sdd doctor
+sdd run --project mi-app --task primera-ejecucion
+```
+
+Con un intake existente:
+
+```powershell
+sdd run --project mi-app --task api-v1 --intake .\mi-idea.yaml
+```
+
+Para reanudar:
+
+```powershell
+sdd resume --workdir .\project\mi-app\primera-ejecucion
+```
+
+`--autonomous` continúa sin intervención humana y `--node` reanuda un nodo concreto.
+
+## Comandos
+
+| Comando | Propósito |
+|---|---|
+| `sdd menu` | Menú interactivo |
+| `sdd shell` | Consola interactiva |
+| `sdd demo` | Pipeline simulado |
+| `sdd run` | Inicia una ejecución real |
+| `sdd resume` | Continúa desde un checkpoint |
+| `sdd web` / `sdd serve` | Inicia el Control Tower |
+| `sdd doctor` | Verifica proveedor, modelo y credencial |
+| `sdd config` | Muestra configuración con keys enmascaradas |
+| `sdd show` | Resumen en terminal |
+| `sdd view` | Genera reporte HTML |
+| `sdd tasks` | Consulta tareas y lifecycle |
+| `sdd chronicle` | Consulta visitas de agentes |
+| `sdd gates` | Ejecuta gates de un nodo |
+| `sdd clean` | Limpia una ejecución objetivo |
+| `sdd test` | Ejecuta la suite |
+
+Usa `sdd <comando> --help` para ver opciones.
+
+## Proveedores
+
+| `SDD_PROVIDER` | Credencial | Integración |
 |---|---|---|
-| G0 | `check_deliverable.py` | se queda: nada lo sustituye |
-| G1 / G8 | `check_traceability.py` | `behave`/`cucumber` con reporte de trazabilidad |
-| G2 | `check_arch_spec.py` | `spectral lint openapi.yaml` + `mmdc` + este para NFR/ADR |
-| G4 | `check_file_size.py` | `eslint` (max-lines, complexity) / `ruff` / `tsc --noEmit` |
-| G5 | `check_hardcoding.py` | `gitleaks detect` + este para el contrato de entorno |
-| G6 | `check_imports.py` | `tsc --noEmit` / `mypy`; anadir `semgrep --config p/owasp-top-ten` |
-| G7 | `check_test_integrity.py` | se queda: es propiedad de paths, no analisis |
-| G9 | `check_suite.py` | ya ejecuta lo real; anadir `--cov` + `diff-cover` |
-| G10 | `check_plan.py` | se queda: valida el contrato del bucle de tareas |
-| R1 | `check_review.py` | no es un gate: es un modelo. Ajusta la rubrica de `agents/reviewer.md`, no lo sustituyas por una herramienta |
-| R2 | `check_review.py` | reseña de código por tarea (dev/qa). Mismo mecanismo que R1, estado por tarea; en modo real cuesta una llamada por tarea |
+| `anthropic` | `ANTHROPIC_API_KEY` | SDK oficial |
+| `deepseek` | `DEEPSEEK_API_KEY` | compatible con OpenAI |
+| `qwen` | `DASHSCOPE_API_KEY` | DashScope compatible |
+| `glm` | `ZHIPUAI_API_KEY` | Zhipu compatible |
+| `kimi` | `MOONSHOT_API_KEY` | Moonshot compatible |
+| `openai` | `SDD_API_KEY` | endpoint definido en `SDD_BASE_URL` |
 
-G9 ejecuta, en orden, los comandos que `spec/20_arch/toolchain.yaml` declare:
-`install → lint → typecheck → security → test → coverage`. Cada paso es opcional
-salvo `test`; si su binario no está instalado, G9 escala en vez de silenciarlo. Ahí
-es donde enchufas eslint/ruff, tsc/mypy, gitleaks/semgrep y `--cov-fail-under`.
+Variables relevantes:
 
-## Invocacion real del agente
+```text
+SDD_PROVIDER
+SDD_MODEL
+SDD_BASE_URL
+SDD_API_KEY
+SDD_TEMPERATURE
+SDD_MAX_TOKENS
+SDD_REVIEW_MODEL
+SDD_PROMPT_CACHE
+```
 
-`pipeline.toml` seccion `[runtime]`, claves `agent_cmd`, `max_concurrency` y
-`gate_concurrency`. El runtime usa `ainvoke`, `AsyncSqliteSaver` y durabilidad
-asíncrona; los gates deterministas se ejecutan en paralelo después de G7. R1/R2
-solo corren cuando todos los G* están verdes y los resultados verdes se reutilizan
-mientras el hash de tarea, prompt y artefactos no cambie.
+`SDD_MODEL` reemplaza el modelo por defecto. Un endpoint OpenAI-compatible genérico requiere `SDD_BASE_URL`, `SDD_API_KEY` y `SDD_MODEL`. Los perfiles de la UI pueden reemplazar proveedor, modelo, temperatura y máximo de tokens por agente.
 
-### Protección contra deadlocks y esperas indefinidas
+## Enrutamiento adaptativo de modelos
 
-Cada proyecto tiene un lease entre procesos adquirido antes de leer su estado.
-Una segunda corrida, `sdd gates` o `sdd clean` sobre el mismo proyecto falla
-rápido en vez de competir por SQLite o por el índice Git. En el panel, el estado
-`starting` se reserva bajo un lock antes de sembrar o reanudar, así dos POST
-simultáneos no pueden arrancar dos procesos.
+`Configuración → Agentes` incluye una política central con vista previa para los seis roles y R1/R2. En modo `adaptive`, `product`, `architect` y `planner` solicitan `frontier`; backend y frontend empiezan en `economy`; QA empieza en `balanced`. Las tareas de implementación y QA pueden consumir un único escalado `frontier` al fallar uno de sus gates propios o R2. El contador vive en el estado de la tarea, por lo que una reanudación no reinicia el escalado.
 
-Los límites `agent_timeout_seconds`, `gate_timeout_seconds`,
-`provider_timeout_seconds`, `git_timeout_seconds` y `lease_wait_seconds` viven en
-`pipeline.toml [runtime]`. Un timeout de agente se enruta como defecto; uno de
-gate produce un gate rojo; Git deshabilita prompts interactivos y devuelve un
-fallo acotado. El orden es siempre lease del proyecto → operación Git; el lock de
-métricas solo protege una escritura y nunca se conserva mientras se espera un
-subproceso.
-Verifica los flags contra
-https://docs.claude.com/en/docs/claude-code/overview antes de usarlo: cambian entre
-versiones. El aislamiento por path se consigue con `git worktree` por tarea mas los
-permisos de herramienta del CLI; `pipeline.toml` declara la propiedad, y G7 la verifica
-a posteriori con `git status`. Las dos capas son necesarias: la preventiva puede
-configurarse mal, la verificadora no depende del agente.
+La selección respeta, en orden, el override explícito del perfil, el proveedor global y la prioridad configurada. Los modelos sin credencial o sin tier clasificado no entran al routing automático. Si falta el tier solicitado se usa el mejor candidato configurado y se registra `fallback_reason`; si no hay ninguna credencial válida, la invocación falla inmediatamente.
 
-## Limites conocidos
+R1/R2 tienen un perfil independiente y prefieren un proveedor `frontier` distinto al autor. `SDD_REVIEW_MODEL` continúa siendo compatible y puede combinarse con `SDD_REVIEW_PROVIDER`. El fallo del revisor conserva el comportamiento fail-open documentado; los gates deterministas mantienen autoridad.
 
-- **SQLite es local.** `.agent/checkpoints.sqlite` es adecuado para esta aplicación
-  local asíncrona de un proceso. Un servicio con varios procesos debe usar un checkpointer
-  PostgreSQL; `state.json` es solo la proyeccion legible para CLI y panel.
-- **La ventana exactamente-una-vez depende del proveedor.** El journal evita
-  repetir una visita completada si el proceso cae antes del checkpoint, pero un
-  corte entre la respuesta del modelo y el journal solo se cierra con una
-  idempotency key soportada por la API externa.
-- **El coste está instrumentado, no expresado en USD.** El límite de llamadas
-  gobierna los agentes principales y el de tokens incluye también revisiones; el
-  precio depende del proveedor y debe calcularse externamente.
-- **Sin retroalimentacion entre corridas**: un defecto que se repite en todos los
-  proyectos deberia acabar en el prompt del nodo, y hoy no lo hace.
-- **El modo real aun necesita medicion.** El runtime, los gates, la recuperacion y
-  el paralelismo se verifican con agentes simulados; falta medir calidad y coste
-  con modelos reales.
+El catálogo se actualiza con `POST /models/discover`. El último catálogo válido permanece en `config.json`. Un modelo nuevo recibe su tier con la misma función que usa el runtime (`classify_model`), de modo que el catálogo y la ejecución nunca afirman tiers distintos sobre el mismo modelo; un tier fijado a mano en `config.json` siempre gana. `GET /routing/preview` expone decisiones y candidatos deshabilitados, nunca API keys.
+## Configuración de agentes
+
+| ID | Rol | Tipo |
+|---|---|---|
+| `product` | Product Strategist | Especificación |
+| `architect` | Solution Architect | Especificación |
+| `planner` | Delivery Planner | Especificación |
+| `dev_backend` | Backend Engineer | Tarea |
+| `dev_frontend` | Frontend Engineer | Tarea |
+| `qa` | Quality Engineer | Tarea |
+
+Cada perfil persiste `enabled`, proveedor, modelo, temperatura `0.0–2.0`, `max_tokens`, herramientas, el `system_prompt` efectivo y `prompt_addon`. El runtime usa el override si existe y, en caso contrario, el prompt nativo de `sdd/agents/`.
+
+La pestaña permite importar y exportar un bundle JSON portable de agentes. El bundle incluye prompts y parámetros, pero excluye API keys y configuración global del proveedor. Los agentes personalizados aparecen en el catálogo y pueden editarse. El grafo automático sigue definido por `sdd/pipeline.toml`; para que un agente nuevo participe todavía debe integrarse en ese contrato.
+
+## Dónde se guardan los datos
+
+La ruta base es `project/`. La UI crea una carpeta por proyecto y ejecución:
+
+```text
+project/
+└── <proyecto>/
+    └── <ejecucion>/
+        ├── spec/
+        │   ├── 00_intake.yaml
+        │   ├── 10_product/
+        │   ├── 20_arch/
+        │   ├── 30_plan/
+        │   └── 40_qa/
+        ├── src/
+        ├── tests/
+        ├── REPORT.md
+        └── .agent/
+            ├── state.json
+            ├── checkpoints.sqlite
+            ├── run.log
+            ├── metrics.jsonl
+            ├── usage.jsonl
+            ├── tasks/<task-id>/lifecycle.jsonl
+            └── chronicle/<visit-id>/
+```
+
+La ruta puede cambiarse en `Configuración → General` o con `output_base` en `config.json`.
+
+`config.json` guarda tema, ruta base, proveedor, modelo, keys, perfiles, agentes personalizados y la política/catálogo de routing. `config.json`, `project/` y `.agent/` están en `.gitignore`.
+
+> **Seguridad:** una key guardada en `config.json` queda en texto claro. Define la variable de entorno del proveedor (`ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, …) y el sistema deja de escribirla a disco: `config.save()` no duplica el secreto cuando la variable ya existe. `sdd doctor` avisa de las keys que sigan en claro y de qué variable las sustituye. Si una key estuvo expuesta en un log, una captura o un transcript, rótala.
+
+## Observabilidad
+
+| Archivo | Contenido |
+|---|---|
+| `.agent/state.json` | Proyección legible del estado global |
+| `.agent/checkpoints.sqlite` | Checkpoints de LangGraph |
+| `.agent/run.log` | Salida de ejecución |
+| `.agent/metrics.jsonl` | Latencias de proveedor, nodos, gates, Git y checkpoints |
+| `.agent/usage.jsonl` | Llamadas y tokens |
+| `.agent/tasks/*/lifecycle.jsonl` | Eventos por tarea |
+| `.agent/chronicle/*` | Prompt, contexto, respuesta y metadatos por visita |
+
+```powershell
+sdd tasks --workdir .\project\mi-app\api-v1 --verbose
+sdd tasks --workdir .\project\mi-app\api-v1 --task-id T-003
+sdd chronicle --workdir .\project\mi-app\api-v1 --recent 10
+sdd chronicle --workdir .\project\mi-app\api-v1 --visit-id <id> --full
+```
+
+`--full` puede mostrar prompts y respuestas sensibles.
+
+## Gates
+
+| Gate | Responsabilidad |
+|---|---|
+| `G0` | Entregables presentes y no vacíos |
+| `G1` / `G8` | Trazabilidad |
+| `G2` | Contrato de arquitectura |
+| `G4` | Tamaño y estructura |
+| `G5` | Hardcoding y entorno |
+| `G6` | Imports y coherencia estática |
+| `G7` | Propiedad de paths e integridad Git |
+| `G9` | Toolchain real: install/lint/typecheck/security/test/coverage |
+| `G10` | Contrato del plan y DAG |
+| `R1` | Revisión crítica de especificación |
+| `R2` | Revisión de implementación por tarea |
+
+Un checker determinista imprime `{"findings":[{"file","line","rule","evidence"}]}` y sale con código `1` cuando hay hallazgos.
+
+## Runtime
+
+`sdd/pipeline.toml` define nodos, prompts, propiedad de paths, entregables, gates, comandos, concurrencia, timeouts y presupuestos.
+
+```toml
+max_concurrency = 6
+gate_concurrency = 4
+```
+
+Reducir `max_concurrency` a `1` conserva la semántica y elimina el paralelismo efectivo.
+
+## API local
+
+| Método | Ruta | Uso |
+|---|---|---|
+| `GET` | `/state` | Snapshot activo |
+| `GET` | `/events` | Stream SSE |
+| `GET` | `/projects`, `/tasks`, `/task` | Historial |
+| `GET` | `/lifecycle` | Traza de tarea |
+| `GET` | `/chronicle` | Visitas de agentes |
+| `GET` | `/artifact` | Lectura segura de artefactos |
+| `GET/POST` | `/config` | Configuración y catálogo; las respuestas nunca incluyen API keys |
+| `GET` | `/routing/preview` | Decisiones proyectadas y candidatos sin secretos |
+| `POST` | `/models/discover` | Actualiza el catálogo del proveedor |
+| `GET` | `/agent-bundle` | Exportación portable de prompts y perfiles, sin secretos |
+| `POST` | `/run` | Nueva ejecución |
+| `POST` | `/resume` | Reanudación |
+
+No expongas este servidor directamente a Internet: no incluye autenticación, TLS ni aislamiento multiusuario.
+
+## Estructura del repositorio
+
+```text
+pyproject.toml
+README.md
+sdd/
+├── __main__.py             # entrada
+├── cli.py                  # comandos
+├── server.py               # API, SSE y servidor web
+├── webpage.py              # HTML del Control Tower
+├── web_script.py           # carga static/app.js
+├── web_styles.py           # carga static/app.css
+├── static/app.js           # interacción y renderizado (JS real, no literal Python)
+├── static/app.css          # sistema visual
+├── graph_runtime.py        # LangGraph y SQLite
+├── orchestrator.py         # supervisor
+├── parallel_tasks.py       # scheduler y workers
+├── scrum.py                # prioridad
+├── taskqueue.py            # dependencias y defectos
+├── task_worktrees.py       # aislamiento Git
+├── lifecycle.py            # eventos por tarea
+├── chronicle.py            # visitas de agentes
+├── metrics.py              # métricas y tokens
+├── config.py               # configuración
+├── providers.py            # proveedores LLM
+├── model_router.py          # política, catálogo, discovery y selección
+├── agent.py                # ejecución del agente
+├── report.py               # reportes
+├── pipeline.toml           # contrato del workflow
+├── agents/                 # prompts base
+├── gates/                  # checkers
+└── examples/fake_agent.py  # simulador
+tests/
+```
+
+## Desarrollo y pruebas
+
+```powershell
+python -m pip install -e .
+sdd test
+```
+
+Pruebas específicas:
+
+```powershell
+python -m pytest tests\test_control_tower_ui.py -q
+python -m pytest tests\test_ui.py -q
+python -m pytest tests\test_task_loop.py tests\test_langgraph_runtime.py -q
+```
+
+El proyecto usa `codebase-memory-mcp` y está indexado bajo el nombre `D-Miguel-auto_scrum`. Para entender el sistema conviene empezar por `manage_adr(mode="get")`, que devuelve la arquitectura persistida. Para descubrir código se consulta primero el grafo (`search_graph`, `trace_path`, `get_code_snippet`) y se usa búsqueda textual solo para literales, configuración o cuando el índice sea insuficiente. El protocolo completo, con la tabla de qué herramienta usar en cada caso y las reglas para mantener el índice limpio, está en `CLAUDE.md`.
+
+## Límites conocidos
+
+- SQLite y el lease están diseñados para una aplicación local de un proceso; un despliegue multiproceso necesita persistencia compartida.
+- La idempotencia completa depende del soporte del proveedor externo.
+- El consumo está instrumentado en tokens, no en moneda.
+- Los agentes personalizados aún no se insertan automáticamente en el grafo.
+- La pestaña de memoria espera eventos estructurados del runtime.
+- Calidad y coste con modelos reales deben medirse por proveedor y proyecto.

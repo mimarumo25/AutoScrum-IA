@@ -18,8 +18,10 @@ dependencies = [
 sdd = "sdd.__main__:_console"
 
 [tool.setuptools]
-packages = ["sdd"]
 include-package-data = true
 
+[tool.setuptools.packages.find]
+include = ["sdd*"]
+
 [tool.setuptools.package-data]
-sdd = ["pipeline.toml", "intake.yaml", "agents/*.md", "examples/*.py", "gates/*.py", "gates/*.toml"]
+sdd = ["pipeline.toml", "intake.yaml", "agents/*.md", "examples/*.py", "gates/*.py", "gates/*.toml", "static/*"]

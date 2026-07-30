@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
-import scrum  # noqa: E402
+from sdd.runtime import scrum
 
 
 def ready():

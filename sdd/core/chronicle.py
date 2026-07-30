@@ -17,7 +17,6 @@ El chronicle NO depende del state.json ni de LangGraph: es un journal append-onl
 paralelo que sobrevive cortes y puede consultarse independientemente del run.
 """
 import json
-import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -57,6 +56,7 @@ def archive_agent_call(workdir: str | Path, visit_id: str,
                        files_written: list[str],
                        files_skipped: list[tuple[str, str]],
                        token_usage: Optional[dict[str, int]] = None,
+                       model_selection: Optional[dict[str, object]] = None,
                        ) -> None:
     base = _chronicle_dir(workdir, visit_id)
 
@@ -86,6 +86,13 @@ def archive_agent_call(workdir: str | Path, visit_id: str,
     }
     if token_usage is not None and token_usage.get("calls", 0) > 0:
         manifest["token_usage"] = token_usage
+    if model_selection:
+        manifest["model_selection"] = {
+            key: model_selection.get(key) for key in (
+                "provider", "model", "tier", "requested_tier",
+                "selection_reason", "fallback_reason", "escalated",
+            )
+        }
 
     _write_json(base / "manifest.json", manifest)
 

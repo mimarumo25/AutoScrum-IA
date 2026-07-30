@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
-import plan_analysis  # noqa: E402
+from sdd.runtime import plan_analysis
 
 
 class TestPlanAnalysis(unittest.TestCase):

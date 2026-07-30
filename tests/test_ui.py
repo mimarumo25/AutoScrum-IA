@@ -16,9 +16,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
-import cli  # noqa: E402
-import report  # noqa: E402
-import server  # noqa: E402
+from sdd import server
+from sdd.presentation import cli, report
 
 
 def _state(**over):
@@ -83,7 +82,7 @@ class TestReport(unittest.TestCase):
 
     def test_performance_section_resume_metricas(self):
         with tempfile.TemporaryDirectory() as tmp:
-            import metrics
+            from sdd.core import metrics
             metrics.record(tmp, "gate_process", duration_ms=20)
             metrics.record(tmp, "gate_process", duration_ms=10)
             text = "\n".join(report._performance_section(tmp))

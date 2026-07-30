@@ -7,10 +7,26 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
-import agent as real_agent  # noqa: E402
+from sdd.runtime import agent as real_agent
+
+
+class TestComposeSystemPrompt(unittest.TestCase):
+    def test_override_addon_y_herramientas_forman_el_prompt_efectivo(self):
+        profile = {
+            "system_prompt": "PROMPT IMPORTADO",
+            "prompt_addon": "Prioriza G7.",
+            "tools": ["gates", "", "tests"],
+        }
+        with mock.patch.object(Path, "read_text", return_value="PROMPT NATIVO"):
+            prompt = real_agent.compose_system_prompt({"prompt": "base.md"}, profile)
+        self.assertIn("PROMPT IMPORTADO", prompt)
+        self.assertNotIn("PROMPT NATIVO", prompt)
+        self.assertIn("Prioriza G7.", prompt)
+        self.assertIn("gates, tests", prompt)
 
 
 class TestParseFiles(unittest.TestCase):

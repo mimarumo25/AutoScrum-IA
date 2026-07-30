@@ -18,12 +18,13 @@ Modelo: SDD_MODEL sobreescribe el default de cada proveedor.
 """
 import json
 import os
+import random
+import re
 import time
 import urllib.error
 import urllib.request
 
-import metrics
-import process_control
+from sdd.core import metrics, process_control
 
 
 class ProviderError(RuntimeError):
@@ -62,9 +63,13 @@ def _add_usage(input_tokens, output_tokens, cache_read=0, cache_creation=0):
 # si nada. Dos defensas distintas para dos fallos distintos:
 #   - corte de transporte  -> reintento con backoff (es transitorio)
 #   - respuesta truncada por max_tokens -> continuacion (no es un error: el modelo
-#     tenia mas que decir). Se le devuelve lo ya emitido como prefill y sigue.
-
-MAX_TOKENS = int(os.environ.get("SDD_MAX_TOKENS", "16000"))
+#     tenia mas que decir). Se retoma con prefill en los modelos que lo aceptan y con
+#     una peticion de continuacion desde el turno de usuario en los que ya no.
+#
+# El techo por defecto es holgado a proposito: en los modelos actuales el pensamiento
+# adaptativo esta activo por defecto y sale del mismo presupuesto que el texto, asi que
+# un max_tokens ajustado al tamano de la respuesta se trunca a media escritura.
+MAX_TOKENS = int(os.environ.get("SDD_MAX_TOKENS", "32000"))
 MAX_CONTINUATIONS = int(os.environ.get("SDD_MAX_CONTINUATIONS", "6"))
 MAX_RETRIES = int(os.environ.get("SDD_MAX_RETRIES", "4"))
 BACKOFF_BASE_S = float(os.environ.get("SDD_BACKOFF_BASE_S", "2"))
@@ -90,7 +95,52 @@ TRANSIENT_NAMES = {
     "URLError", "socket.timeout", "BadStatusLine",
     "InternalServerError", "RateLimitError", "OverloadedError", "ServiceUnavailable",
 }
-TRANSIENT_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+# 409 NO esta aqui a proposito: un Conflict es semantico (el recurso cambio, la
+# peticion contradice el estado actual), no un fallo de transporte. Reintentarlo a
+# ciegas repite la misma peticion invalida y gasta el presupuesto sin cambiar nada.
+TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def _status_of(exc: BaseException) -> int | None:
+    """Codigo HTTP del error, venga del SDK o de urllib."""
+    seen, cur = set(), exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        for candidate in (getattr(cur, "status_code", None),
+                          getattr(getattr(cur, "response", None), "status_code", None),
+                          getattr(cur, "code", None)):
+            if isinstance(candidate, int):
+                return candidate
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Lee Retry-After si el proveedor dijo cuanto esperar. Se respeta tal cual.
+
+    Un 429 trae el tiempo que el proveedor considera correcto; ignorarlo y aplicar
+    el backoff propio vuelve a golpear antes de que se libere la cuota.
+    """
+    seen, cur = set(), exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        headers = (getattr(getattr(cur, "response", None), "headers", None)
+                   or getattr(cur, "headers", None))
+        if headers is not None:
+            for name in ("retry-after", "Retry-After"):
+                try:
+                    raw = headers.get(name)
+                except AttributeError:
+                    raw = None
+                if raw:
+                    try:
+                        # Solo el formato en segundos; una fecha HTTP no es fiable
+                        # sin sincronia de reloj, y equivocarse alarga la espera.
+                        return max(0.0, float(str(raw).strip()))
+                    except ValueError:
+                        return None
+        cur = cur.__cause__ or cur.__context__
+    return None
 
 
 def _is_transient(exc: BaseException) -> bool:
@@ -108,6 +158,22 @@ def _is_transient(exc: BaseException) -> bool:
     return False
 
 
+def _backoff_delay(attempt: int, exc: BaseException) -> tuple[float, str]:
+    """Espera antes del siguiente intento y el motivo, para poder registrarlo.
+
+    Devuelve Retry-After si el proveedor lo indico; si no, backoff exponencial con
+    jitter. El jitter no es cosmetico: el sprint corre hasta runtime.max_concurrency
+    workers contra el mismo proveedor, y sin componente aleatorio un 429 los sincroniza
+    a todos en la misma ventana de reintento, que es la forma de convertir un limite
+    de velocidad en una tormenta.
+    """
+    indicated = _retry_after_seconds(exc)
+    if indicated is not None:
+        return indicated, "Retry-After"
+    ceiling = BACKOFF_BASE_S * (2 ** (attempt - 1))
+    return random.uniform(ceiling / 2, ceiling), "backoff+jitter"
+
+
 def _with_retry(fn, what: str):
     """Ejecuta fn con backoff exponencial mientras el fallo sea transitorio."""
     last = None
@@ -120,11 +186,13 @@ def _with_retry(fn, what: str):
             last = e
             if not _is_transient(e) or attempt == MAX_RETRIES:
                 break
-            delay = BACKOFF_BASE_S * (2 ** (attempt - 1))
+            delay, source = _backoff_delay(attempt, e)
             print(f"  [provider] {what}: {type(e).__name__} — reintento "
-                  f"{attempt}/{MAX_RETRIES - 1} en {delay:.0f}s", flush=True)
+                  f"{attempt}/{MAX_RETRIES - 1} en {delay:.1f}s ({source})", flush=True)
             time.sleep(delay)
-    raise ProviderError(f"{what} fallo tras {MAX_RETRIES} intento(s): "
+    status = _status_of(last)
+    detail = f" HTTP {status}" if status else ""
+    raise ProviderError(f"{what} fallo tras {MAX_RETRIES} intento(s):{detail} "
                         f"{type(last).__name__}: {last}") from last
 
 
@@ -132,14 +200,22 @@ def _continue_until_complete(call, seed_prefill=""):
     """Acumula la respuesta a traves de continuaciones hasta que deje de truncarse.
 
     `call(prefill) -> (texto, truncado)`. Cuando el modelo corta por limite de
-    tokens se le reenvia lo ya escrito como turno de asistente y retoma ahi; el
-    protocolo de bloques <<<FILE:>>> sobrevive intacto al empalme.
+    tokens se retoma desde lo ya escrito; el protocolo de bloques <<<FILE:>>>
+    sobrevive intacto al empalme.
+
+    Una respuesta vacia se trata como fallo, no como respuesta. Devolverla dejaria al
+    agente sin nada que escribir, saliendo con 0: un fallo invisible. Vale para todos
+    los proveedores, no solo para el que sepa declarar una negativa explicita.
     """
     acc = seed_prefill
     for i in range(MAX_CONTINUATIONS + 1):
         text, truncated = call(acc)
         acc = (acc + text).rstrip()
         if not truncated:
+            if not acc.strip():
+                raise ProviderError(
+                    "el proveedor devolvio una respuesta vacia sin senalar error; "
+                    "no hay entregable que escribir")
             return acc
         if i < MAX_CONTINUATIONS:
             print(f"  [provider] respuesta truncada por limite de tokens; "
@@ -166,6 +242,51 @@ OPENAI_PRESETS = {
 }
 
 ANTHROPIC_DEFAULT_MODEL = "claude-opus-5"
+
+# --- Capacidades por modelo (Anthropic) ------------------------------------
+# Los modelos de generacion actual RETIRARON parametros que antes eran normales, y
+# enviarlos ya no se ignora: devuelve HTTP 400. Las dos listas son de modelos que SI
+# aceptan cada cosa, no de los que la rechazan: un modelo desconocido (o uno nuevo
+# puesto a mano en SDD_MODEL) cae en el camino seguro, porque omitir el parametro es
+# valido en todas las generaciones mientras enviarlo no lo es.
+#
+#   temperature/top_p/top_k -> 400 en opus-5, sonnet-5, opus-4-8, opus-4-7, fable-5
+#   prefill del ultimo turno de asistente -> 400 tambien en opus-4-6 y sonnet-4-6
+SAMPLING_OK_MODELS = frozenset({
+    "claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5",
+    "claude-opus-4-6", "claude-sonnet-4-6",
+    "claude-opus-4-1", "claude-opus-4-0", "claude-sonnet-4-0",
+})
+PREFILL_OK_MODELS = frozenset({
+    "claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5",
+    "claude-opus-4-1", "claude-opus-4-0", "claude-sonnet-4-0",
+})
+
+
+def _base_model_id(model: str) -> str:
+    """Quita el sufijo de fecha para comparar contra las tablas de capacidades."""
+    return re.sub(r"-\d{8}$", "", (model or "").strip())
+
+
+def accepts_sampling(model: str) -> bool:
+    return _base_model_id(model) in SAMPLING_OK_MODELS
+
+
+def accepts_prefill(model: str) -> bool:
+    return _base_model_id(model) in PREFILL_OK_MODELS
+
+
+# Continuacion sin prefill: en los modelos que ya no aceptan prefill hay que pedir la
+# continuacion desde el turno de usuario. Es menos hermetico que el prefill (el modelo
+# podria repetir), asi que la primera defensa es un max_tokens holgado y esta es la
+# segunda. Se manda solo la cola: basta para empalmar y mantiene acotado el prompt.
+CONTINUATION_TAIL_CHARS = 4000
+CONTINUATION_TEMPLATE = (
+    "Tu respuesta anterior se corto por el limite de tokens. Esto es el final de lo "
+    "que alcanzaste a emitir:\n\n<<<COLA>>>\n{tail}\n<<<FIN_COLA>>>\n\n"
+    "Continua exactamente desde ese punto. No repitas nada de lo anterior, no escribas "
+    "preambulo ni recapitulacion, y manten intacto el protocolo de bloques <<<FILE:>>>."
+)
 
 # Modelos seleccionables por proveedor (para el dropdown de la interfaz). El
 # primero de cada lista es el default. 'openai' es libre: se escribe SDD_MODEL.
@@ -237,7 +358,10 @@ def complete(system: str, user: str) -> str:
             os.environ.get("SDD_METRICS_WORKDIR"),
             os.environ.get("SDD_METRICS_OPERATION", "llm"),
             duration_ms=round((time.perf_counter() - started) * 1000, 3),
-            outcome=outcome, provider=p,
+            outcome=outcome, provider=p, model=os.environ.get("SDD_MODEL", ""),
+            tier=os.environ.get("SDD_MODEL_TIER", ""),
+            selection_reason=os.environ.get("SDD_SELECTION_REASON", ""),
+            escalated=os.environ.get("SDD_MODEL_ESCALATED") == "1",
             node=os.environ.get("SDD_METRICS_NODE", ""),
             task=os.environ.get("SDD_METRICS_TASK", ""),
             input_chars=len(system) + len(user), **usage)
@@ -245,7 +369,11 @@ def complete(system: str, user: str) -> str:
             metrics.record_usage(
                 os.environ.get("SDD_METRICS_WORKDIR"),
                 operation=os.environ.get("SDD_METRICS_OPERATION", "llm"),
-                provider=p, node=os.environ.get("SDD_METRICS_NODE", ""),
+                provider=p, model=os.environ.get("SDD_MODEL", ""),
+                tier=os.environ.get("SDD_MODEL_TIER", ""),
+                selection_reason=os.environ.get("SDD_SELECTION_REASON", ""),
+                escalated=os.environ.get("SDD_MODEL_ESCALATED") == "1",
+                node=os.environ.get("SDD_METRICS_NODE", ""),
                 task=os.environ.get("SDD_METRICS_TASK", ""), **usage)
 
 
@@ -263,13 +391,25 @@ def _anthropic(system: str, user: str) -> str:
     def call(prefill: str):
         messages = [{"role": "user", "content": user}]
         if prefill:
-            messages.append({"role": "assistant", "content": prefill})
+            if accepts_prefill(model):
+                messages.append({"role": "assistant", "content": prefill})
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": CONTINUATION_TEMPLATE.format(
+                        tail=prefill[-CONTINUATION_TAIL_CHARS:]),
+                })
 
         def once():
             # Streaming: max_tokens alto sin riesgo de timeout HTTP.
             kwargs = {"model": model, "max_tokens": _max_tokens(),
-                      "temperature": _temperature(),
                       "system": system, "messages": messages}
+            # En los modelos actuales el pensamiento adaptativo esta activo por
+            # defecto y consume del mismo max_tokens que el texto: no se configura
+            # aqui (el default es el ajuste recomendado), pero por eso el techo de
+            # tokens es holgado.
+            if accepts_sampling(model):
+                kwargs["temperature"] = _temperature()
             if os.environ.get("SDD_PROMPT_CACHE", "1") != "0":
                 kwargs["cache_control"] = {"type": "ephemeral"}
             with client.messages.stream(**kwargs) as stream:
@@ -281,6 +421,17 @@ def _anthropic(system: str, user: str) -> str:
             getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0),
             getattr(u, "cache_read_input_tokens", 0),
             getattr(u, "cache_creation_input_tokens", 0))
+        # Una negativa del clasificador llega como HTTP 200 con content vacio o
+        # parcial. Sin esta comprobacion, text queda en "" y _continue_until_complete
+        # devuelve la cadena vacia como respuesta COMPLETA: el agente no escribe
+        # nada, sale con 0, y el fallo se vuelve invisible. Es exactamente lo que
+        # CLAUDE.md prohibe, hecho por el transporte y no por el agente.
+        if getattr(msg, "stop_reason", None) == "refusal":
+            details = getattr(msg, "stop_details", None)
+            category = getattr(details, "category", None) or "sin categoria"
+            raise ProviderError(
+                f"el modelo rechazo la peticion (stop_reason=refusal, "
+                f"categoria={category}). No hay entregable que escribir.")
         text = "".join(b.text for b in msg.content if b.type == "text")
         return text, msg.stop_reason == "max_tokens"
 
