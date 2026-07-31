@@ -1,0 +1,7 @@
+entries:
+  - id: NFR-001
+    category: reliability
+    metric: number of duplicate short codes generated
+    threshold: 0
+    method_of_measurement: automated tests simulating high concurrency insertion requests
+    gate_id: G-test
