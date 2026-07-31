@@ -209,5 +209,81 @@ class TestBackoff(unittest.TestCase):
         self.assertGreater(delay, 0)
 
 
+class TestBreakpointDeCache(ProviderContractCase):
+    """El breakpoint de cache iba como parametro top-level de la request.
+
+    No existe tal parametro en la Messages API: el breakpoint se declara dentro
+    de un bloque de contenido. El fallo no daba error, solo 0 aciertos de cache
+    en 310 registros de usage.jsonl — el peor tipo de bug, el que parece
+    funcionar.
+    """
+
+    def test_el_breakpoint_va_en_el_bloque_de_system(self):
+        _, captured = self.call_anthropic("claude-opus-5", [_Message()],
+                                          env={"SDD_PROMPT_CACHE": "1"})
+        system = captured[0]["system"]
+        self.assertIsInstance(system, list)
+        self.assertEqual(system[0]["type"], "text")
+        self.assertEqual(system[0]["text"], "sistema")
+        self.assertEqual(system[0]["cache_control"], {"type": "ephemeral"})
+
+    def test_nunca_va_en_el_nivel_superior(self):
+        """La regresion concreta: `kwargs["cache_control"] = ...`."""
+        for cache in ("0", "1"):
+            with self.subTest(SDD_PROMPT_CACHE=cache):
+                _, captured = self.call_anthropic("claude-opus-5", [_Message()],
+                                                  env={"SDD_PROMPT_CACHE": cache})
+                self.assertNotIn("cache_control", captured[0])
+
+    def test_desactivarlo_devuelve_system_como_cadena(self):
+        _, captured = self.call_anthropic("claude-opus-5", [_Message()],
+                                          env={"SDD_PROMPT_CACHE": "0"})
+        self.assertEqual(captured[0]["system"], "sistema")
+
+    def test_el_contexto_volatil_queda_despues_del_breakpoint(self):
+        """Si el contexto que cambia en cada llamada entrara antes del
+        breakpoint, el prefijo no casaria nunca y el cache seria inutil."""
+        _, captured = self.call_anthropic("claude-opus-5", [_Message()],
+                                          env={"SDD_PROMPT_CACHE": "1"})
+        self.assertEqual(captured[0]["messages"][0]["content"], "usuario")
+
+
+class TestCamposDeCacheOpenAI(unittest.TestCase):
+    """Los tokens de cache de los proveedores OpenAI-compatibles se descartaban,
+    asi que el ahorro de los nodos dev_* era invisible en usage.jsonl."""
+
+    def test_campo_plano(self):
+        self.assertEqual(
+            providers._openai_cache_fields(
+                "deepseek", {"prompt_tokens": 100, "prompt_cache_hit_tokens": 64}),
+            (64, 0))
+
+    def test_campo_anidado_estilo_openai(self):
+        self.assertEqual(
+            providers._openai_cache_fields(
+                "openai", {"prompt_tokens": 100,
+                           "prompt_tokens_details": {"cached_tokens": 32}}),
+            (32, 0))
+
+    def test_sin_campos_de_cache_registra_las_claves_reales(self):
+        """No se adivina el nombre: si ningun candidato aparece, se deja
+        constancia de lo que el proveedor SI devolvio para que una corrida real
+        lo confirme en vez de que el codigo lo suponga para siempre."""
+        with mock.patch.object(providers.metrics, "record") as record:
+            with mock.patch.dict("os.environ",
+                                 {"SDD_METRICS_WORKDIR": "/tmp/x"}, clear=False):
+                read, write = providers._openai_cache_fields(
+                    "glm", {"prompt_tokens": 10, "algo_desconocido": 5})
+        self.assertEqual((read, write), (0, 0))
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[1], "provider_usage_sin_cache")
+        self.assertIn("algo_desconocido", record.call_args.kwargs["keys"])
+
+    def test_usage_vacio_no_registra_nada(self):
+        with mock.patch.object(providers.metrics, "record") as record:
+            self.assertEqual(providers._openai_cache_fields("glm", {}), (0, 0))
+        record.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ import json
 import os
 import shlex
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -181,6 +182,37 @@ def run_node_gates(node_id: str, workdir: str,
     return reports
 
 
+_HISTORY_LOCK = threading.Lock()
+
+
 def _save_report(directory: Path, node_id: str, report: dict[str, object]) -> None:
     path = directory / f"{node_id}.{report['gate_id']}.json"
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    _append_history(directory, node_id, report)
+
+
+def _append_history(directory: Path, node_id: str,
+                    report: dict[str, object]) -> None:
+    """Anade el intento a un journal append-only junto al reporte canonico.
+
+    El JSON canonico se sobrescribe en cada intento: el intento 1 desaparecia
+    cuando corria el 2, asi que no habia forma de medir la tasa de PRIMERA
+    pasada de un gate — justo la metrica que dice si un cambio mejora algo.
+
+    Los gates corren en un ThreadPoolExecutor, asi que un write_text concurrente
+    intercalaria lineas; se escribe con O_APPEND bajo lock, como en metrics.
+    """
+    findings = report.get("findings") or []
+    line = json.dumps({
+        "at": time.time(),
+        "gate_id": report.get("gate_id"),
+        "status": report.get("status"),
+        "rules": [str(item.get("rule", "")) for item in findings],
+    }, ensure_ascii=False, separators=(",", ":")) + "\n"
+    path = directory / f"{node_id}.{report['gate_id']}.history.jsonl"
+    with _HISTORY_LOCK:
+        handle = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            os.write(handle, line.encode("utf-8"))
+        finally:
+            os.close(handle)

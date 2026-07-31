@@ -1,9 +1,11 @@
 """Concurrencia alrededor de gates inmutables."""
+import json
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -90,3 +92,46 @@ class TestConcurrentGates(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHistorialDeIntentos(unittest.TestCase):
+    """El reporte canonico se sobrescribe en cada intento.
+
+    Sin historial no se puede medir la tasa de PRIMERA pasada de un gate, que es
+    exactamente la metrica que dice si un cambio mejora algo o solo lo mueve.
+    """
+
+    def test_cada_intento_anade_una_linea(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            optimized_gates._save_report(directory, "architect", {
+                "gate_id": "G2", "status": "fail",
+                "findings": [{"rule": "adr-sin-coste"}]})
+            optimized_gates._save_report(directory, "architect", {
+                "gate_id": "G2", "status": "pass", "findings": []})
+            history = (directory / "architect.G2.history.jsonl").read_text(
+                encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(history), 2)
+            primero, segundo = (json.loads(line) for line in history)
+            self.assertEqual(primero["status"], "fail")
+            self.assertEqual(primero["rules"], ["adr-sin-coste"])
+            self.assertEqual(segundo["status"], "pass")
+            # El canonico refleja el ultimo intento, como antes.
+            canonico = json.loads(
+                (directory / "architect.G2.json").read_text(encoding="utf-8"))
+            self.assertEqual(canonico["status"], "pass")
+
+    def test_escrituras_concurrentes_no_intercalan(self):
+        """Los gates corren en un ThreadPoolExecutor."""
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            report = {"gate_id": "G4", "status": "pass", "findings": []}
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                for _ in range(40):
+                    pool.submit(optimized_gates._save_report,
+                                directory, "qa", dict(report))
+            lines = (directory / "qa.G4.history.jsonl").read_text(
+                encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 40)
+            for line in lines:
+                json.loads(line)          # cada linea es JSON completo

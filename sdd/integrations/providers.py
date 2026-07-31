@@ -49,6 +49,65 @@ def _reset_usage():
                        cache_creation_input_tokens=0)
 
 
+def _system_param(system: str) -> str | list[dict[str, object]]:
+    """El parametro `system` con el breakpoint de cache donde de verdad va.
+
+    Esto estaba roto de una forma que no daba error: se pasaba
+    `cache_control={"type": "ephemeral"}` como parametro TOP-LEVEL de la
+    request. No existe tal parametro en la Messages API — el breakpoint se
+    declara dentro de un bloque de contenido — asi que no se creaba ninguno.
+    Medido: 0 tokens de cache_read en 310 registros de usage.jsonl.
+
+    El orden de render es `tools` -> `system` -> `messages`, asi que un
+    breakpoint en el ultimo bloque de system cachea tambien las herramientas si
+    las hay. El prompt de sistema de un nodo es estable entre llamadas; el
+    contexto volatil (specs, inventario, defectos) va en `messages`, despues del
+    breakpoint, que es exactamente donde debe estar para que el prefijo casque.
+    """
+    if os.environ.get("SDD_PROMPT_CACHE", "1") == "0":
+        return system
+    return [{"type": "text", "text": system,
+             "cache_control": {"type": "ephemeral"}}]
+
+
+# Nombres de los campos de cache en los proveedores OpenAI-compatibles. NO estan
+# verificados contra documentacion oficial: cada proveedor usa el suyo y este
+# paquete no puede afirmar cual. Se prueban los candidatos conocidos y, cuando
+# ninguno aparece, se registran las claves que el proveedor SI devolvio para que
+# una corrida real las confirme en vez de que este codigo las adivine para
+# siempre. Un 0 aqui significa "no medido", no "no hubo cache".
+CACHE_READ_KEYS = ("prompt_cache_hit_tokens", "cache_read_input_tokens",
+                   "cached_tokens")
+CACHE_WRITE_KEYS = ("cache_creation_input_tokens", "cache_write_tokens")
+
+
+def _openai_cache_fields(provider: str, usage: dict) -> tuple[int, int]:
+    """Tokens de cache leidos/escritos, si el proveedor los expone.
+
+    Antes se descartaban: `_add_usage(prompt_tokens, completion_tokens)` sin mas,
+    asi que el ahorro por cache de los nodos dev_* era invisible en usage.jsonl.
+    """
+    # OpenAI los anida en prompt_tokens_details; los demas los ponen planos.
+    flat = dict(usage)
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        flat.update(details)
+
+    def first(keys: tuple[str, ...]) -> int:
+        for key in keys:
+            value = flat.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+        return 0
+
+    read, write = first(CACHE_READ_KEYS), first(CACHE_WRITE_KEYS)
+    if not read and not write and flat:
+        metrics.record(os.environ.get("SDD_METRICS_WORKDIR"),
+                       "provider_usage_sin_cache", provider=provider,
+                       keys=sorted(str(key) for key in flat))
+    return read, write
+
+
 def _add_usage(input_tokens, output_tokens, cache_read=0, cache_creation=0):
     _LAST_USAGE["input_tokens"] += int(input_tokens or 0)
     _LAST_USAGE["output_tokens"] += int(output_tokens or 0)
@@ -403,15 +462,13 @@ def _anthropic(system: str, user: str) -> str:
         def once():
             # Streaming: max_tokens alto sin riesgo de timeout HTTP.
             kwargs = {"model": model, "max_tokens": _max_tokens(),
-                      "system": system, "messages": messages}
+                      "system": _system_param(system), "messages": messages}
             # En los modelos actuales el pensamiento adaptativo esta activo por
             # defecto y consume del mismo max_tokens que el texto: no se configura
             # aqui (el default es el ajuste recomendado), pero por eso el techo de
             # tokens es holgado.
             if accepts_sampling(model):
                 kwargs["temperature"] = _temperature()
-            if os.environ.get("SDD_PROMPT_CACHE", "1") != "0":
-                kwargs["cache_control"] = {"type": "ephemeral"}
             with client.messages.stream(**kwargs) as stream:
                 return stream.get_final_message()
 
@@ -485,7 +542,9 @@ def _openai_compatible(provider: str, system: str, user: str) -> str:
 
         data = _with_retry(once, f"{provider} chat/completions")
         u = data.get("usage") or {}
-        _add_usage(u.get("prompt_tokens"), u.get("completion_tokens"))
+        cache_read, cache_creation = _openai_cache_fields(provider, u)
+        _add_usage(u.get("prompt_tokens"), u.get("completion_tokens"),
+                   cache_read, cache_creation)
         try:
             choice = data["choices"][0]
             return choice["message"]["content"] or "", choice.get("finish_reason") == "length"
