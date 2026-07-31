@@ -246,6 +246,32 @@ def active_task(workdir: Path) -> dict:
         return {}
 
 
+def gather_gate_vocabulary(node: str) -> str:
+    """Los gate_id que existen de verdad, para el nodo que debe referenciarlos.
+
+    El arquitecto tiene que poner un `gate_id` valido en cada NFR, pero nunca se
+    le dijo cual es el vocabulario: inventaba 'gate-performance', 'G11' o
+    'Not critical' y G2 lo reprobaba con razon. Es un defecto del prompt, no del
+    agente — se le pedia referenciar un conjunto cerrado sin darselo. Se lee del
+    registro, no se escribe a mano, para que no pueda desincronizarse de lo que
+    el gate acepta.
+    """
+    if node != "architect":
+        return ""
+    try:
+        data = tomllib.loads((ROOT / "gates/registry.toml").read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    ids = [str(gate["id"]) for gate in data.get("gate", []) if gate.get("id")]
+    if not ids:
+        return ""
+    return ("GATE_ID VALIDOS PARA spec/20_arch/nfr.yaml. Es un vocabulario "
+            "CERRADO leido de gates/registry.toml; cualquier otro valor reprueba "
+            "G2. Si ningun gate automatico comprueba el umbral, el unico valor "
+            "honesto es exactamente 'manual'.\n"
+            + ", ".join([*ids, "manual"]))
+
+
 def gather_defects(workdir: Path, node: str) -> str:
     """Defectos del ciclo anterior para este nodo, para que el modelo los corrija."""
     reports = workdir / ".agent/reports"
@@ -317,6 +343,7 @@ def main():
         task_text,
         f"ESPECIFICACION RELEVANTE PARA TU ROL:\n{gather_specs(workdir, node, extra_globs)}",
         f"ARBOL DE CODIGO ACTUAL (lo que existe de verdad hoy):\n{gather_inventory(workdir)}",
+        gather_gate_vocabulary(node),
         gather_defects(workdir, node),
         PROTOCOL.format(allowed=allowed),
     ]))

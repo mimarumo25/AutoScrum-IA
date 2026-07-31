@@ -206,6 +206,43 @@ class TestG5Conformance(unittest.TestCase):
                 self.assertNotIn(regla, self._run(self.LIMPIO + exenta))
 
 
+class TestVocabularioDeGatesSinDeriva(unittest.TestCase):
+    """El arquitecto debe recibir los gate_id que G2 acepta, exactamente.
+
+    G2 reprobaba 'gate-performance', 'G11' y 'Not critical' con razon: no
+    existen. Pero al arquitecto nunca se le dio la lista, asi que se le exigia
+    acertar un vocabulario cerrado a ciegas. Si la lista que se le inyecta y la
+    que el gate acepta se desincronizan, vuelve el mismo fallo por otra via.
+    """
+
+    def _registry_ids(self) -> set[str]:
+        import tomllib
+        data = tomllib.loads(
+            (GATES / "registry.toml").read_text(encoding="utf-8"))
+        return {str(gate["id"]) for gate in data["gate"]}
+
+    def test_el_prompt_recibe_exactamente_los_gates_del_registro(self) -> None:
+        sys.path.insert(0, str(ROOT.parent))
+        from sdd.runtime.agent import gather_gate_vocabulary
+
+        texto = gather_gate_vocabulary("architect")
+        self.assertTrue(texto, "el arquitecto no recibe vocabulario de gates")
+        esperados = self._registry_ids() | {"manual"}
+        # La ultima linea es la lista separada por comas.
+        anunciados = {item.strip() for item in texto.splitlines()[-1].split(",")}
+        self.assertEqual(anunciados, esperados)
+
+    def test_solo_el_arquitecto_lo_recibe(self) -> None:
+        """Los demas nodos no escriben nfr.yaml: darles la lista es ruido que
+        paga tokens en cada llamada."""
+        sys.path.insert(0, str(ROOT.parent))
+        from sdd.runtime.agent import gather_gate_vocabulary
+
+        for node in ("product", "planner", "dev_backend", "dev_frontend", "qa"):
+            with self.subTest(node=node):
+                self.assertEqual(gather_gate_vocabulary(node), "")
+
+
 # --- Cobertura del propio arnes ---------------------------------------------
 
 def _rule_identifiers(source: str) -> tuple[set[str], set[str]]:

@@ -13,7 +13,10 @@ ENTREGABLES OBLIGATORIOS
 1. spec/20_arch/ARCHITECTURE.md: contexto, limites, modulos, responsabilidades,
    estrategia de API y datos, despliegue, observabilidad, decisiones y trazabilidad.
 2. spec/20_arch/nfr.yaml: id, categoria, metrica, umbral, metodo_de_medicion y
-   gate_id valido para Usabilidad, Seguridad, Rendimiento y Escalabilidad.
+   gate_id para Usabilidad, Seguridad, Rendimiento y Escalabilidad. El gate_id
+   sale de la lista cerrada que recibes en el contexto (GATE_ID VALIDOS); no
+   inventes identificadores. Si ningun gate automatico comprueba el umbral, usa
+   exactamente 'manual': es la unica salida honesta.
 3. spec/20_arch/adr/ADR-###.md: una decision por archivo con contexto, al menos dos
    alternativas descartadas, costo estimado, consecuencias y condicion de reversion.
 4. spec/20_arch/api/openapi.yaml: OpenAPI 3.1 completo, errores tipados y referencia
