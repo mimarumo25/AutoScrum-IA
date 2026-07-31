@@ -27,7 +27,7 @@ mi propia Fase 0 resultaron falsas y están corregidas abajo.
 | — Vocabulario de `gate_id` (no estaba en el plan) | **Hecha** | `be527fe` |
 | 3 — Telemetría | **Parcial**: historial por intento hecho; ver abajo | `4689bc6` |
 | 4 — Victorias de coste | **Hecha** | `4689bc6` |
-| 5-9 — Bucle auto-verificante | **NO ejecutadas. Premisa falsada.** | — |
+| 5-9 — Bucle auto-verificante | **NO ejecutadas. Premisa falsada — no construir.** | — |
 
 ### El criterio de corte del plan se cumplió — sin el bucle
 
@@ -86,6 +86,52 @@ salida, así que el ahorro es de orden 2 %. A cambio, R1/R2 son la **única** ca
 con juicio que puede detectar gaming de un gate — precisamente el riesgo #1 de
 este plan si algún día se añade el bucle. Debilitar al revisor para ahorrar 2 %
 es un mal cambio. Queda como decisión explícita del operador, no como pendiente.
+
+### Medición de primera pasada POR gate — el bucle no está justificado
+
+Dos fuentes independientes (`chronicle`, 96 registros de `attempts` por visita, y
+`metrics.jsonl`, 647 ejecuciones de `gate_process`) concuerdan en la forma:
+
+| Gate | chronicle | metrics | Lectura |
+|---|---|---|---|
+| G2 | 6 % | 0 % | **ya arreglado** sin bucle (6/6 contrafactual) |
+| G9 | 0 % | 0 % | único hueco real |
+| G10 | 33 % | 25 % | 4 unidades — muestra insuficiente |
+| R1 | 50 % | 57 % | aditivo por diseño, no frena nada |
+| G1 | 72 % | 85 % | sano |
+| G0 | 97 % | 95 % | sano |
+| G4 · G5 · G6 · G7 | 100 % | 94-100 % | **ya al 100 %** |
+| R2 | 100 % | 68 % | aditivo |
+
+**G4, G5, G6 y G7 ya están al 100 %.** La Tarea 8 del plan (bucle en los nodos
+`dev_*`) apuntaba precisamente a G6 y G4: allí el bucle sería coste puro sin
+ningún fallo que corregir. Queda sin justificación.
+
+El único hueco es G9, y está concentrado en **una** unidad: 4 de 5 unidades
+corrieron G9 una vez y fallaron; `demo-fastapi-fullstack/flujo-completo` T-003 lo
+corrió **56 veces** (398,8 s) con 68 llamadas a agente, y su secuencia de
+veredictos **oscila**: `xxxx...x..xxxx..xxxxx..xxx.` — pasa y vuelve a fallar
+sobre la misma unidad.
+
+**Por eso el bucle no arregla G9.** La causa de esa unidad no es que el agente no
+viera el veredicto: es que el veredicto no era estable. Meter una suite cuyo
+resultado oscila DENTRO del turno haría que el agente corrigiera contra ruido,
+que es peor que no verificar. Y hay un segundo mecanismo detrás:
+`orchestrator.py:342-345` borra `attempts[unidad:gate]` cuando el gate pasa, asi
+que cada `pass` intermedio **devuelve el presupuesto de reintentos completo**.
+`attempts` registra `T-003:G9: 5` frente a 56 ejecuciones reales; solo los topes
+globales (`max_agent_calls`, `max_wall_minutes`) acotaron la corrida.
+
+**Recomendación:** no construir el bucle. El trabajo con retorno real, en orden:
+
+1. Distinguir si la oscilación de G9 es no-determinismo de la suite o ciclos de
+   regresión genuinos (comparar la huella de árbol entre un `pass` y el `fail`
+   siguiente: si el árbol es idéntico y el veredicto cambia, es no-determinismo).
+2. Impedir que un `pass` refinancie el presupuesto de reintentos de un gate que
+   ya oscilo, sin romper el caso legítimo (un gate que pasa no debe arrastrar
+   rencor de intentos viejos).
+
+Ambos son mucho más pequeños que las Tareas 5-9 y atacan la causa medida.
 
 ### Hueco destapado por el arnés
 
