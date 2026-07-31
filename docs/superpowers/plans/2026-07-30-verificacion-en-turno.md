@@ -14,6 +14,89 @@
 
 ---
 
+## ESTADO DE EJECUCIÓN — 2026-07-30
+
+**Léelo antes de continuar por la Tarea 5.** La ejecución de las Tareas 1-4
+midió cosas que cambian la justificación del resto del plan. Dos afirmaciones de
+mi propia Fase 0 resultaron falsas y están corregidas abajo.
+
+| Tarea | Estado | Commit |
+|---|---|---|
+| 1 — Arnés de conformidad | **Hecha** | `fff338d` |
+| 2 — Correcciones de G2 | **Hecha** (5 falsos positivos, no 4) | `fff338d` |
+| — Vocabulario de `gate_id` (no estaba en el plan) | **Hecha** | `be527fe` |
+| 3 — Telemetría | **Parcial**: historial por intento hecho; ver abajo | `4689bc6` |
+| 4 — Victorias de coste | **Hecha** | `4689bc6` |
+| 5-9 — Bucle auto-verificante | **NO ejecutadas. Premisa falsada.** | — |
+
+### El criterio de corte del plan se cumplió — sin el bucle
+
+El plan decía: *"Si la tasa de primera pasada de G2 no sube por encima del 70 %
+después de la Tarea 2 sola, el diagnóstico estaba mal y las Tareas 5-9 no deben
+ejecutarse."* Medido sobre los 6 conjuntos de artefactos reales de `project/`:
+
+| Configuración | Primera pasada de G2 |
+|---|---|
+| Gate roto (línea base) | 1/6 — 17 % |
+| Gate corregido (Tarea 2) | 2/6 — 33 % |
+| + vocabulario de `gate_id` correcto | **6/6 — 100 %** |
+
+El umbral se superó, pero **lo superaron los prerrequisitos, no el bucle**. Tras
+la Tarea 2, el único fallo restante de G2 era `nfr-gate-inexistente`, y era un
+verdadero positivo: `agents/architect.md` exigía un "gate_id valido" sin decir
+nunca cuál es el conjunto válido. De 24 referencias en corridas reales, 8 eran
+inventadas (`gate-performance`, `G11`, `Not critical`, `G-test`). Defecto de
+prompt, no del agente. Se arregla inyectando el vocabulario leído de
+`registry.toml` — 10 líneas, 0 tokens extra, 0 latencia.
+
+**Consecuencia para las Tareas 5-9:** ya no queda nada que el bucle pueda
+arreglar en G2. Su justificación tendría que venir de otros gates donde el
+agente siga fallando (G6 imports, G9 suite), y **eso no está medido**. Construir
+el bucle ahora sería hacerlo sobre una premisa que la medición ya no sostiene.
+El siguiente paso correcto es medir la tasa de primera pasada por gate con el
+historial que la Tarea 3 acaba de habilitar, y decidir con esos datos.
+
+El contrafactual del 100 % sustituye mecánicamente cada `gate_id` inventado por
+`manual` y reejecuta G2: mide el techo que desbloquea el arreglo, **no** que el
+modelo vaya a usar bien la lista. Eso exige una corrida real y no está
+verificado. La muestra son 6 proyectos de juguete de la misma familia
+(acortadores de URL, calculadora); no es una muestra representativa.
+
+### Correcciones a la Fase 0 de este plan
+
+1. **«R1/R2 registran `tier=""`» — FALSO.** `sdd/gates/check_review.py:112` sí
+   envuelve la llamada en `model_router.selection_environment`, que fija
+   `SDD_MODEL_TIER`. El hueco de telemetría es **histórico**: las corridas
+   antiguas lo tienen vacío, las dos más recientes (`guia-tours`,
+   `servicios-control-tower`) lo tienen completo en el 100 % de sus registros.
+   Ya lo arregló el trabajo del `model_router`. El Paso 1 de la Tarea 3 no tenía
+   nada que arreglar y **no se ejecutó**.
+2. **«4 defectos en `check_arch_spec.py`» — eran 5.** El quinto: la regex de
+   coste solo aceptaba `usd|coste|costo`, y los ADR reales escriben
+   `## Cost estimate` y `$0/month` en inglés. Y las alternativas no tienen dos
+   formas sino **cuatro** (encabezado+items, etiqueta en negrita+items, tabla
+   markdown, prosa enumerada); las cuatro aparecen en corridas reales y las
+   cuatro son conformes.
+
+### Paso 2 de la Tarea 3 (R2 → `balanced`): NO ejecutado, contraindicado
+
+El plan proponía bajar R2 de `frontier` a `balanced` para ahorrar. La medición lo
+desaconseja: las revisiones son ~9 % de los tokens de entrada y ~7 % de los de
+salida, así que el ahorro es de orden 2 %. A cambio, R1/R2 son la **única** capa
+con juicio que puede detectar gaming de un gate — precisamente el riesgo #1 de
+este plan si algún día se añade el bucle. Debilitar al revisor para ahorrar 2 %
+es un mal cambio. Queda como decisión explícita del operador, no como pendiente.
+
+### Hueco destapado por el arnés
+
+El conteo de reglas del arnés reveló que **15 reglas de gate no tienen ninguna
+prueba** en toda la suite (8 de `check_plan.py`, 5 de `check_suite.py`, 1 de
+`check_hardcoding.py`, 1 de `check_traceability.py`). Están declaradas en
+`SIN_ARNES_TODAVIA` con motivo explícito para que el hueco sea contable en vez
+de invisible. Vaciar esa lista es trabajo pendiente declarado.
+
+---
+
 ## Riesgos, antes de la solución
 
 Enumerados primero a propósito. Si alguno resulta inaceptable, el plan se detiene en la Tarea 2 y aun así entrega el 60 % del valor.
