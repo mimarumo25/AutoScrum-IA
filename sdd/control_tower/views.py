@@ -410,6 +410,8 @@ def view_payload(workdir, status, provider, project, task, runtime=None):
         "input": idea,
         "activity": activity,
         "failure": failure,
+        "pending_review": raw_state.get("pending_review"),
+        "evaluation": raw_state.get("evaluation"),
         "recoveries": raw_state.get("recoveries", []),
         "revision": runtime.get("revision", 0),
         "updated_at": runtime.get("updated_at", 0),

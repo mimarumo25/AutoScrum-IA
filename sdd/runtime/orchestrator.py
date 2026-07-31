@@ -20,30 +20,33 @@ Uso:
   python orchestrator.py --workdir /ruta/al/repo --from dev_backend
 """
 import argparse
-import json
 import os
 import shlex
 import sys
 import time
 import tomllib
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from sdd.core import chronicle, config, lifecycle, metrics, process_control, run_lease  # noqa: E402
+from sdd.core import chronicle, lifecycle, metrics, process_control, run_lease  # noqa: E402
 from sdd.core.execution_journal import invoke_once  # noqa: E402
 from sdd.core.run_lease import RunBusyError  # noqa: E402
 from sdd.presentation.report import write_run_report  # noqa: E402
 from sdd.runtime import graph_runtime, plan_analysis, taskqueue  # noqa: E402
 from sdd.runtime.optimized_gates import run_node_gates  # noqa: E402
+from sdd.runtime import workflow_contracts  # noqa: E402
+from sdd.runtime.workflow_contracts import Evaluation  # noqa: E402
+from sdd.runtime.artifact_integrity import allowed_roots, content_hash  # noqa: E402
+from sdd.runtime.run_state import load_state, save, token_usage  # noqa: E402
+from sdd.runtime.workflow_defects import (  # noqa: E402
+    resolve_linear_recoveries as _resolve_linear_recoveries,
+)
+
+HumanDecision = workflow_contracts.HumanDecision
 
 ROOT = Path(__file__).resolve().parents[1]
 LOOP = "task_loop"
-
-# Fallos que ningun agente puede arreglar escribiendo codigo: falta un binario,
-# no hay red, la suite se colgo. Reintentar es quemar llamadas; se escala ya.
-ENVIRONMENT_RULES = {"toolchain-no-disponible", "entorno-sin-red", "suite-colgada"}
 
 # La evidencia de un defecto en un repo real puede traer caracteres no-cp1252;
 # forzar UTF-8 evita que el logging del orquestador reviente en consolas Windows.
@@ -79,195 +82,8 @@ def route(reports, pipeline):
     return None, None, []
 
 
-# --- Estado -----------------------------------------------------------------
-
-def load_state(workdir, start):
-    path = Path(workdir) / ".agent/state.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8")), path
-    state = {
-        "run_id": (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-")
-                   + uuid.uuid4().hex[:8]),
-        "cursor": start,
-        "status": "running",
-        "attempts": {},
-        "agent_calls": 0,
-        "started_at": time.time(),
-        "tasks": [],
-        "current_task": None,
-        "defect_seq": 0,
-        "recovery_seq": 0,
-        "recoveries": [],
-        "resume_stack": [],
-        "history": [],
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return state, path
-
-
-def save(state, path):
-    started = time.perf_counter()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Nombre único: dos proyecciones cercanas no comparten el mismo .tmp. En
-    # Windows un lector puede mantener state.json abierto unos milisegundos;
-    # reintentamos el replace atómico en vez de perder toda la reanudación.
-    pending = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    try:
-        pending.write_text(
-            json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-        for attempt in range(6):
-            try:
-                pending.replace(path)
-                break
-            except PermissionError:
-                if attempt == 5:
-                    raise
-                time.sleep(0.025 * (attempt + 1))
-    finally:
-        pending.unlink(missing_ok=True)
-    metrics.record(path.parent.parent, "state_projection",
-                   duration_ms=round((time.perf_counter() - started) * 1000, 3),
-                   bytes=path.stat().st_size)
-
-
-def _resume_findings(state):
-    """Recupera el último grupo de defectos anterior al cierre de la corrida."""
-    history = state.get("history") or []
-    terminal_index = next((index for index in range(len(history) - 1, -1, -1)
-                           if history[index].get("event") in {
-                               "ESCALATE_HUMAN", "RECUPERACION_EN_ESPERA",
-                               "RAMAS_EN_ESPERA"}), len(history))
-    last_defect = next((history[index] for index in range(terminal_index - 1, -1, -1)
-                        if history[index].get("event") == "DEFECTO"), None)
-    if last_defect is None:
-        return "", "", []
-    gate = str(last_defect.get("gate") or "")
-    owner = str(last_defect.get("owner") or state.get("cursor") or "")
-    findings = []
-    for event in reversed(history[:terminal_index]):
-        if event.get("event") == "AGENTE_INICIO" and findings:
-            break
-        if event.get("event") != "DEFECTO":
-            continue
-        if str(event.get("gate") or "") != gate or \
-                str(event.get("owner") or owner) != owner:
-            if findings:
-                break
-            continue
-        location = str(event.get("ubicacion") or "")
-        file_name, line = location, 0
-        if ":" in location:
-            candidate, raw_line = location.rsplit(":", 1)
-            try:
-                file_name, line = candidate, int(raw_line)
-            except ValueError:
-                pass
-        findings.append({
-            "file": file_name, "line": line,
-            "rule": str(event.get("regla") or "fallo-anterior"),
-            "evidence": str(event.get("evidencia") or "corrección pendiente"),
-        })
-    findings.reverse()
-    return owner, gate, findings
-
-
-def _restore_resume_recovery(state, workdir):
-    """Migra checkpoints antiguos a una tarea de corrección consumible."""
-    if not workdir:
-        return None
-    recoveries = state.setdefault("recoveries", [])
-    for recovery in recoveries:
-        if recovery.get("status") == "needs_input":
-            recovery["status"] = "assigned"
-    assigned = [item for item in recoveries if item.get("status") == "assigned"]
-    if not assigned and not state.get("tasks"):
-        owner, gate, findings = _resume_findings(state)
-        failed_node = str(state.get("cursor") or owner)
-        if owner and gate and findings:
-            recovery = _assign_linear_recovery(
-                state, workdir, failed_node, owner, gate, findings, 0)
-            # La corrida ya agotó el modelo base antes de pedir continuación.
-            recovery["model_escalated"] = True
-            recovery["model_escalation_count"] = max(
-                1, int(recovery.get("model_escalation_count", 0)))
-            assigned = [recovery]
-    owners = {str(item.get("owner")) for item in assigned if item.get("owner")}
-    for owner in owners:
-        taskqueue.publish_current(workdir, _linear_recovery_context(state, owner))
-    return assigned[-1] if assigned else None
-
-
-def prepare_resume(state, workdir=None):
-    """Prepara un checkpoint terminal para continuar desde el fallo real.
-
-    Los nodos lineales conservan su cursor exacto. Solo los cursores paralelos
-    ``parallel_dispatch`` y ``parallel_collect`` vuelven al scheduler porque el
-    batch anterior ya no puede reutilizarse con seguridad.
-    """
-    previous = state.get("status")
-    resume_cursor = state.get("cursor")
-    resumed_at = time.time()
-    previous_started_at = state.get("started_at")
-    state.setdefault("resume_history", []).append({
-        "t": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "status": previous,
-        "cursor": resume_cursor,
-        "current_task": state.get("current_task"),
-        "attempts": dict(state.get("attempts") or {}),
-        "started_at": previous_started_at,
-        "resumed_at": resumed_at,
-    })
-    state["resume_checkpoint"] = {
-        "from_node": resume_cursor,
-        "from_task": state.get("current_task"),
-        "previous_status": previous,
-    }
-    state["status"] = "running"
-    state["attempts"] = {}
-    state["resume_at"] = None
-    if previous_started_at is not None:
-        state.setdefault("original_started_at", previous_started_at)
-    # max_wall_minutes es el presupuesto de una sesión activa, no la edad del
-    # proyecto. Una continuación explícita recibe una ventana nueva.
-    state["started_at"] = resumed_at
-    state["resume_started_at"] = resumed_at
-    taskqueue.reactivate_attention_tasks(state.get("tasks") or [])
-    if state.get("cursor") in {"parallel_dispatch", "parallel_collect"}:
-        state["cursor"] = LOOP
-        state["parallel_batch"] = None
-        state["parallel_results"] = {}
-        state["worker_task_id"] = None
-        state["current_task"] = None
-    recovery = _restore_resume_recovery(state, workdir)
-    state["resume_recovery"] = ({
-        "id": recovery.get("id"), "owner": recovery.get("owner"),
-        "failed_node": recovery.get("failed_node"),
-        "gate_id": recovery.get("gate_id"),
-        "findings": len(recovery.get("findings") or []),
-    } if recovery else None)
-    return previous
-
-
 def git(workdir, *args):
     return process_control.run_git(workdir, *args, text=True)
-
-
-def token_usage(workdir):
-    """Suma .agent/usage.jsonl. Vacio en modo simulado (no hay tokens)."""
-    path = Path(workdir) / ".agent/usage.jsonl"
-    total = {"input_tokens": 0, "output_tokens": 0, "calls": 0,
-             "cache_read_input_tokens": 0,
-             "cache_creation_input_tokens": 0}
-    if not path.exists():
-        return total
-    for line in path.read_text(encoding="utf-8").splitlines():
-        try:
-            rec = json.loads(line)
-        except ValueError:
-            continue
-        for k in total:
-            total[k] += int(rec.get(k, 0) or 0)
-    return total
 
 
 def log(state, event, **kw):
@@ -413,238 +229,8 @@ def enter_task_loop(state, workdir, log_fn):
     return task["node"]
 
 
-def _linear_recovery_context(state, owner):
-    """Construye la tarea visible que recibe un agente al corregir a otro."""
-    assigned = [item for item in state.setdefault("recoveries", [])
-                if item.get("status") == "assigned" and item.get("owner") == owner]
-    findings = []
-    seen = set()
-    for recovery in assigned:
-        for finding in recovery.get("findings") or []:
-            identity = (finding.get("file"), finding.get("line"),
-                        finding.get("rule"), finding.get("evidence"))
-            if identity in seen:
-                continue
-            seen.add(identity)
-            findings.append(finding)
-    gates = sorted({str(item.get("gate_id")) for item in assigned})
-    sources = sorted({str(item.get("failed_node")) for item in assigned})
-    return {
-        "id": "+".join(str(item["id"]) for item in assigned),
-        "title": f"Corregir hallazgos solicitados por {', '.join(sources)}",
-        "node": owner, "kind": "defect", "status": "pending",
-        "gate_id": ",".join(gates), "findings": findings,
-        # Los archivos senalados son contexto, no nuevos entregables. Si se
-        # publicaran como deliverables, G0 sustituiria los must_produce del nodo
-        # e intentaria validar incluso rutas de directorio como archivos.
-        "deliverables": [],
-        "context": sorted({finding.get("file") for finding in findings
-                           if finding.get("file") and "*" not in finding.get("file")}),
-        "depends_on": [], "fr_refs": [],
-        "acceptance": "Corregir los hallazgos y dejar verdes los gates indicados",
-        "model_escalated": any(item.get("model_escalated") for item in assigned),
-        "model_escalation_count": max(
-            [int(item.get("model_escalation_count", 0)) for item in assigned] or [0]),
-        "recovery_ids": [str(item["id"]) for item in assigned],
-    }
-
-
-def _assign_linear_recovery(state, workdir, failed_node, owner, gate_id,
-                            findings, attempt):
-    """Crea o actualiza un handoff durable sin perder el punto de retorno."""
-    recoveries = state.setdefault("recoveries", [])
-    recovery = next((item for item in reversed(recoveries)
-                     if item.get("status") == "assigned"
-                     and item.get("failed_node") == failed_node
-                     and item.get("owner") == owner
-                     and item.get("gate_id") == gate_id), None)
-    if recovery is None:
-        state["recovery_seq"] = int(state.get("recovery_seq", 0)) + 1
-        recovery = {
-            "id": f"R-{state['recovery_seq']:03d}",
-            "failed_node": failed_node, "owner": owner,
-            "gate_id": gate_id, "status": "assigned",
-            "model_escalation_count": 0,
-        }
-        recoveries.append(recovery)
-    recovery["findings"] = findings
-    recovery["attempt"] = attempt
-    if owner != failed_node:
-        stack = state.setdefault("resume_stack", [])
-        if not stack or stack[-1] != failed_node:
-            stack.append(failed_node)
-    taskqueue.publish_current(workdir, _linear_recovery_context(state, owner))
-    return recovery
-
-
-def _resolve_linear_recoveries(state, workdir, owner, next_node, log_fn):
-    """Libera a todos los agentes que esperaban una correccion del propietario."""
-    assigned = [item for item in state.setdefault("recoveries", [])
-                if item.get("status") == "assigned" and item.get("owner") == owner]
-    if not assigned:
-        return None
-    for recovery in assigned:
-        recovery["status"] = "corrected"
-        recovery["resolved_by"] = owner
-    taskqueue.clear_current(workdir)
-    return_target = next((str(item.get("failed_node")) for item in reversed(assigned)
-                          if item.get("failed_node") != owner), None)
-    stack = state.setdefault("resume_stack", [])
-    if return_target:
-        while stack:
-            candidate = stack.pop()
-            if candidate == return_target:
-                break
-    log_fn(state, "CORRECCION_RECIBIDA", de=owner,
-           reanuda=return_target or next_node,
-           recuperaciones=",".join(str(item["id"]) for item in assigned))
-    return return_target
-
-
-def handle_defect(state, workdir, node, task, owner, gate_id, findings, budget, log_fn):
-    """Reintenta, delega o pausa solo la rama afectada por un defecto."""
-    for f in findings[:5]:
-        log_fn(state, "DEFECTO", gate=gate_id, owner=owner,
-               ubicacion=f"{f['file']}:{f['line']}", regla=f["rule"], evidencia=f["evidence"])
-
-    env_hit = next((f for f in findings if f["rule"] in ENVIRONMENT_RULES), None)
-    if env_hit:
-        reason = (f"{env_hit['rule']} — requiere intervencion en la maquina: "
-                  f"{env_hit['evidence'][:160]}")
-        if task:
-            taskqueue.mark_needs_input(state["tasks"], task["id"], reason, gate_id)
-            lifecycle.blocked(workdir, task["id"], "human-input", gate_id, findings)
-            state["current_task"] = None
-            state["cursor"] = LOOP
-            log_fn(state, "RAMA_EN_ESPERA", tarea=task["id"], nodo=node["id"],
-                   gate=gate_id, motivo=reason)
-        else:
-            # Falta un binario, no hay red o la suite se colgo: ningun agente puede
-            # arreglarlo escribiendo codigo. Es un fallo que exige intervencion en la
-            # maquina, no una pausa a la espera de una firma.
-            state["status"] = "escalated"
-            log_fn(state, "RECUPERACION_EN_ESPERA", nodo=node["id"],
-                   gate=gate_id, motivo=reason)
-            log_fn(state, "ESCALATE_HUMAN", nodo=node["id"], gate=gate_id,
-                   motivo=reason)
-        return
-
-    if gate_id == "G7":
-        for f in findings:
-            git(workdir, "checkout", "--", f["file"])
-            git(workdir, "clean", "-fd", f["file"])
-        log_fn(state, "REVERT", archivos=len(findings), motivo="violacion de propiedad")
-
-    key = f"{task['id']}:{gate_id}" if task else f"{owner}:{gate_id}"
-    state["attempts"][key] = state["attempts"].get(key, 0) + 1
-    if task:
-        lifecycle.retried(workdir, task["id"], gate_id,
-                          state["attempts"][key],
-                          budget["max_retries_per_gate"])
-    eligible = {
-        "dev_backend": {"G0", "G4", "G5", "G6", "G7", "R2"},
-        "dev_frontend": {"G0", "G4", "G5", "G6", "G7", "R2"},
-        "qa": {"G8", "G9", "R2"},
-    }
-    routing = config.load().get("routing", {})
-    max_escalations = int(routing.get("max_frontier_escalations_per_task", 1))
-    if (task and owner == node["id"] and gate_id in eligible.get(node["id"], set())
-            and int(task.get("model_escalation_count", 0)) < max_escalations):
-        task["model_escalation_count"] = int(task.get("model_escalation_count", 0)) + 1
-        task["model_escalated"] = True
-        task["model_escalation_gate"] = gate_id
-        taskqueue.publish_current(workdir, task)
-        lifecycle.model_escalated(workdir, task["id"], gate_id,
-                                  task["model_escalation_count"])
-        log_fn(state, "MODEL_ESCALATION", tarea=task["id"], gate=gate_id,
-               tier="frontier", intento=task["model_escalation_count"])
-
-    attempt = state["attempts"][key]
-    exhausted = attempt > budget["max_retries_per_gate"]
-
-    if task is None:
-        recovery = _assign_linear_recovery(
-            state, workdir, node["id"], owner, gate_id, findings, attempt)
-        if exhausted:
-            if int(recovery.get("model_escalation_count", 0)) < max_escalations:
-                recovery["model_escalation_count"] = \
-                    int(recovery.get("model_escalation_count", 0)) + 1
-                recovery["model_escalated"] = True
-                # No se reinicia state["attempts"][key]: hacerlo convertiria
-                # max_retries_per_gate en el doble sin tocar pipeline.toml, que es
-                # relajar un presupuesto por la puerta de atras. El escalado lleva su
-                # propio contador y su propio techo (max_frontier_escalations_per_task),
-                # y consume el intento en el que ocurre.
-                taskqueue.publish_current(workdir,
-                                          _linear_recovery_context(state, owner))
-                log_fn(state, "MODEL_ESCALATION", recuperacion=recovery["id"],
-                       gate=gate_id, tier="frontier",
-                       intento=recovery["model_escalation_count"])
-            else:
-                recovery["status"] = "needs_input"
-                # 'escalated', no 'waiting_human': waiting_human es la pausa firmada
-                # del gate humano y main() la devuelve con codigo 0. Reutilizarla aqui
-                # hacia que una corrida que NO convergio saliera con exito.
-                state["status"] = "escalated"
-                log_fn(state, "RECUPERACION_EN_ESPERA", id=recovery["id"],
-                       nodo=node["id"], espera=owner, gate=gate_id,
-                       motivo="la correccion automatica no convergio")
-                log_fn(state, "ESCALATE_HUMAN", nodo=node["id"], espera=owner,
-                       gate=gate_id, motivo="la correccion automatica no convergio")
-                return
-        state["cursor"] = owner
-        log_fn(state, "AGENTE_EN_ESPERA", nodo=node["id"], espera=owner,
-               gate=gate_id, recuperacion=recovery["id"])
-        log_fn(state, "CORRECCION_ASIGNADA", id=recovery["id"], de=node["id"],
-               a=owner, gate=gate_id, intento=attempt)
-        return
-
-    if exhausted:
-        if state["defect_seq"] >= budget.get("max_defect_tasks", 12):
-            reason = f"la rama agoto {state['defect_seq']} tareas de correccion"
-            taskqueue.mark_needs_input(state["tasks"], task["id"], reason, gate_id)
-            lifecycle.blocked(workdir, task["id"], "human-input", gate_id, findings)
-            state["current_task"] = None
-            state["cursor"] = LOOP
-            log_fn(state, "RAMA_EN_ESPERA", tarea=task["id"], nodo=node["id"],
-                   gate=gate_id, motivo=reason)
-            return
-        state["defect_seq"] += 1
-        defect = taskqueue.make_defect(state["tasks"], owner, gate_id, findings,
-                                       task, state["defect_seq"], workdir)
-        lifecycle.blocked(workdir, task["id"], defect["id"], gate_id, findings)
-        log_fn(state, "AGENTE_EN_ESPERA", nodo=node["id"], espera=owner,
-               tarea=task["id"], correccion=defect["id"], gate=gate_id)
-        log_fn(state, "DEFECTO_TAREA", id=defect["id"], para=owner,
-               bloquea=task["id"], gate=gate_id)
-        state["cursor"] = LOOP
-        return
-
-    if owner == node["id"]:                       # el dueno es quien corrio: reintenta
-        state["cursor"] = node["id"]
-        log_fn(state, "ENRUTADO", a=owner, intento=state["attempts"][key],
-               reanuda_en=task["id"] if task else owner)
-        return
-
-    # Fase de tareas: el defecto es de otro. Se convierte en trabajo suyo.
-    if state["defect_seq"] >= budget.get("max_defect_tasks", 12):
-        state["status"] = "escalated"
-        log_fn(state, "ESCALATE_HUMAN", motivo="tope de tareas de defecto alcanzado")
-        return
-    state["defect_seq"] += 1
-    defect = taskqueue.make_defect(state["tasks"], owner, gate_id, findings,
-                                    task, state["defect_seq"], workdir)
-    if task:
-        lifecycle.blocked(workdir, task["id"], defect["id"], gate_id, findings)
-    log_fn(state, "AGENTE_EN_ESPERA", nodo=node["id"], espera=owner,
-           tarea=task["id"], correccion=defect["id"], gate=gate_id)
-    log_fn(state, "DEFECTO_TAREA", id=defect["id"], para=owner,
-           bloquea=task["id"], gate=gate_id)
-    state["cursor"] = LOOP
-
-
 def approve(state, workdir, node, task, log_fn):
-    """Cierra un nodo o una tarea en verde. Solo declara commit si lo hubo."""
+    """Aplica efectos de aprobacion y deja el destino para una arista."""
     changed, detail = commit(workdir, taskqueue.commit_message(node["id"], task),
                              node.get("writes", []))
     log_fn(state, "APROBADO", nodo=node["id"],
@@ -654,33 +240,22 @@ def approve(state, workdir, node, task, log_fn):
         taskqueue.mark_done(state["tasks"], task["id"], workdir)
         state["current_task"] = None
         taskqueue.clear_current(workdir)
-        state["cursor"] = LOOP
+        state["approval_next"] = LOOP
         return
     return_target = _resolve_linear_recoveries(
         state, workdir, node["id"], node["next"], log_fn)
     if return_target:
-        state["cursor"] = return_target
+        state["approval_next"] = return_target
         return
     nxt = state.pop("resume_at", None) or node["next"]
     if nxt == node["id"]:
         nxt = node["next"]
-    if nxt == "done":
-        state["status"] = "done"
-    else:
-        state["cursor"] = nxt
+    state["approval_next"] = nxt
 
 
 # --- Ciclo principal --------------------------------------------------------
 
-def step(state, args, cfg, nodes, auto_human):
-    """Una visita de nodo completa: agente -> gates -> ruta."""
-    if state["cursor"] == LOOP:
-        target = enter_task_loop(state, args.workdir, log)
-        if target is None:
-            return
-        state["cursor"] = target
-        return
-
+def _active_unit(state, nodes):
     node = nodes[state["cursor"]]
     # La tarea activa manda, venga del plan o de un defecto. Un defecto puede
     # pertenecer a un nodo que no es de tarea (el arquitecto y un toolchain roto,
@@ -689,15 +264,31 @@ def step(state, args, cfg, nodes, auto_human):
     task = taskqueue.by_id(state["tasks"], state.get("current_task"))
     if task is not None and task["node"] != node["id"]:
         task = None
+    return node, task
+
+
+def _solution(state, args, node, task):
+    allowed = allowed_roots(node, task)
+    artifacts = [path for path in dirty_paths(args.workdir)
+                 if any(path == str(root).rstrip("/") or
+                        path.startswith(str(root).rstrip("/") + "/") or
+                        (not str(root).endswith("/") and
+                         path.startswith(str(root) + "."))
+                        for root in allowed)]
+    return {
+        "kind": "worktree" if task else "artifacts",
+        "worktree": str(args.workdir) if task else None,
+        "artifacts": artifacts,
+        "node": node["id"],
+        "task_id": task["id"] if task else None,
+    }
+
+
+def generate(state, args, cfg, nodes, _auto_human=False):
+    """Ejecuta solo al productor y registra la solucion materializada."""
+    node, task = _active_unit(state, nodes)
     label = f"{node['id']} · {task['id']}" if task else node["id"]
     print(f"\n>> nodo {label}", flush=True)
-
-    if node.get("type") == "human" and not auto_human:
-        state["status"] = "waiting_human"
-        log(state, "GATE_HUMANO",
-            accion=f"revisar spec/ y spec/30_plan/tasks.yaml, luego "
-                   f"reanudar con --from {node['next']}")
-        return
 
     if state["agent_calls"] >= cfg["budget"]["max_agent_calls"]:
         state["status"] = "escalated"
@@ -717,9 +308,30 @@ def step(state, args, cfg, nodes, auto_human):
     log(state, "AGENTE", nodo=node["id"], tarea=task["id"] if task else "-",
         resultado="human" if detail == "human" else f"exit={rc}"
                   + (f" · {detail}" if rc != 0 and detail else ""))
+    unit_id = f"{node['id']}:{task['id'] if task else 'linear'}"
+    generation = {
+        "unit_id": unit_id, "node": node["id"],
+        "task_id": task["id"] if task else None,
+        "returncode": rc, "detail": detail,
+        "solution": _solution(state, args, node, task),
+    }
+    state["generation"] = generation
+    state.setdefault("iterations", []).append({
+        "unit_id": unit_id, "stage": "generation",
+        "attempt": int(state.get("retry_count", 0)) + 1,
+        "solution": generation["solution"],
+        "feedback": str(state.get("feedback", "")),
+    })
+
+
+def evaluate(state, args, cfg, nodes, _auto_human=False):
+    """Ejecuta gates/revisor y produce una Evaluation Pydantic serializable."""
+    node, task = _active_unit(state, nodes)
+    generation = dict(state.get("generation") or {})
+    rc = int(generation.get("returncode", 1))
+    detail = str(generation.get("detail", "generacion ausente"))
 
     if rc != 0:
-        # Sin esta rama, un agente muerto pasaba por gates vacios y se daba por bueno.
         reports = agent_failure_report(node["id"], rc, detail)
     else:
         log(state, "GATES_INICIO", nodo=node["id"],
@@ -727,6 +339,10 @@ def step(state, args, cfg, nodes, auto_human):
         reports = run_node_gates(node["id"], args.workdir, cfg)
         for r in reports:
             log(state, "GATE " + r["gate_id"], estado=r["status"], hallazgos=len(r["findings"]))
+            if r["status"] == "pass":
+                key = (f"{task['id']}:{r['gate_id']}" if task else
+                       f"{node['id']}:{r['gate_id']}")
+                state.setdefault("attempts", {}).pop(key, None)
             if task:
                 lifecycle.gate_result(args.workdir, task["id"],
                                       r["gate_id"], r["status"] == "pass",
@@ -738,13 +354,43 @@ def step(state, args, cfg, nodes, auto_human):
                     r["status"], r["findings"])
 
     owner, gate_id, findings = route(reports, cfg)
-    if owner is None:
-        if node["id"] == "planner":
-            plan_analysis.log_plan(args.workdir, state, log)
-        approve(state, args.workdir, node, task, log)
-    else:
-        handle_defect(state, args.workdir, node, task, owner, gate_id,
-                      findings, cfg["budget"], log)
+    feedback = "\n".join(
+        f"{item['rule']}: {item['evidence']}" for item in findings)
+    evaluation = Evaluation(
+        unit_id=str(generation.get("unit_id") or
+                    f"{node['id']}:{task['id'] if task else 'linear'}"),
+        node=node["id"], task_id=task["id"] if task else None,
+        approved=owner is None, gate_id=gate_id, owner=owner,
+        feedback=feedback, findings=findings, reports=reports,
+        solution=dict(generation.get("solution") or {}),
+        content_roots=allowed_roots(node, task),
+        content_hash=content_hash(args.workdir, allowed_roots(node, task)),
+    )
+    persisted = evaluation.model_dump(mode="json")
+    state["evaluation"] = persisted
+    state["feedback"] = evaluation.feedback
+    state.setdefault("iterations", []).append({
+        "unit_id": evaluation.unit_id, "stage": "evaluation",
+        "attempt": int(state.get("retry_count", 0)) + 1,
+        "approved": evaluation.approved, "feedback": evaluation.feedback,
+        "findings": [item.model_dump(mode="json") for item in evaluation.findings],
+    })
+    log(state, "EVALUACION", unidad=evaluation.unit_id,
+        estado="pass" if evaluation.approved else "fail",
+        hallazgos=len(evaluation.findings))
+
+
+def approve_unit(state, args, _cfg, nodes):
+    """Efecto de la arista approve_unit; no clasifica ni selecciona rutas."""
+    evaluation = Evaluation.model_validate(state.get("evaluation") or {})
+    node = nodes[evaluation.node]
+    task = taskqueue.by_id(state["tasks"], evaluation.task_id)
+    if not evaluation.approved:
+        raise ValueError("approve_unit requiere una evaluacion aprobada")
+    if node["id"] == "planner":
+        plan_analysis.log_plan(args.workdir, state, log)
+        node = {**node, "next": nodes["human_gate"]["next"]}
+    approve(state, args.workdir, node, task, log)
 
 
 def main():
@@ -752,8 +398,8 @@ def main():
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--task", default="Ejecutar el plan de spec/30_plan/tasks.yaml")
     ap.add_argument("--from", dest="start", default=None,
-                    help="nodo donde empezar o reanudar; sobrescribe el cursor "
-                         "guardado (asi se sale del gate humano: --from task_loop)")
+                    help="nodo donde empezar o reanudar fuera de una pausa HITL; "
+                         "un interrupt humano exige --resume")
     ap.add_argument("--resume", action="store_true",
                     help="reanuda una corrida interrumpida o escalada desde donde "
                          "quedo (cursor guardado), con presupuesto de reintentos "
@@ -762,8 +408,12 @@ def main():
                     help="agentes falsos: prueba el plano de control sin gastar tokens")
     ap.add_argument("--auto-approve-human", action="store_true")
     ap.add_argument("--autonomous", action="store_true",
-                    help="sin intervencion humana: auto-aprueba el gate y emite reporte final")
+                     help="sin intervencion humana: auto-aprueba el gate y emite reporte final")
+    ap.add_argument("--human-decision", choices=("accept", "reject"))
+    ap.add_argument("--human-feedback", default="")
     args = ap.parse_args()
+    if args.human_decision == "reject" and not args.human_feedback:
+        ap.error("--human-feedback es obligatorio con --human-decision reject")
     # En modo autonomo el gate humano se auto-aprueba, pero solo se alcanza tras
     # product, architect y planner en verde: nunca firma sobre un plan invalido.
     auto_human = args.auto_approve_human or args.autonomous
@@ -783,16 +433,19 @@ def main():
     nodes = {n["id"]: n for n in cfg["node"]}
     existed = (Path(args.workdir) / ".agent/state.json").exists()
     state, spath = load_state(args.workdir, args.start or "product")
+    if (args.resume and state.get("status") == "waiting_human"
+            and args.human_decision is None):
+        ap.error("--human-decision accept|reject es obligatorio para reanudar HITL")
     if args.start:
+        if state.get("status") == "waiting_human":
+            print("hay una decision HITL pendiente; usa --resume con "
+                  "--human-decision accept|reject", flush=True)
+            return 1
         # --from explicito reanuda: antes se ignoraba si ya habia state.json, asi
         # que salir del gate humano era imposible — volvia a pararse en el mismo sitio.
-        previous = state.get("status")
         state["cursor"], state["status"] = args.start, "running"
         state["attempts"] = {}
         state["resume_at"] = None
-        if previous == "waiting_human" and args.start != "human_gate":
-            state["human_approval"] = graph_runtime.approval_record(
-                args.workdir, "cli --from", mode="explicit-node")
     elif args.resume:
         # Reanudar: retomar donde quedo sin perder el trabajo ya commiteado. Sirve
         # tanto para una corrida que se corto (proceso muerto, conexion caida:
@@ -803,15 +456,8 @@ def main():
             print("no hay corrida que reanudar en este proyecto; inicia una nueva.",
                   flush=True)
             return 1
-        prev = prepare_resume(state, args.workdir)
-        # Si el checkpoint esta en interrupt(), graph_runtime envia Command.resume
-        # para que la firma humana quede dentro del historial durable del grafo.
-        log(state, "REANUDADO", desde=state.get("cursor"), estado_previo=prev)
-        if state.get("resume_recovery"):
-            recovery = state["resume_recovery"]
-            log(state, "RECUPERACION_RESTAURADA", id=recovery.get("id"),
-                para=recovery.get("owner"), gate=recovery.get("gate_id"),
-                hallazgos=recovery.get("findings"))
+        # graph_runtime reconstruye la intencion sobre el snapshot SQLite. Para
+        # interrupt() solo transmite la decision, nunca esta proyeccion.
     elif state["status"] != "running":
         # Relanzar un proyecto ya terminado sin --from/--resume era un no-op que
         # reimprimia 'COMPLETADO' y salia con 0: exactamente el falso exito que este
@@ -826,7 +472,8 @@ def main():
 
     state = graph_runtime.run_pipeline(
         state, spath, args, cfg, nodes, auto_human,
-        step, log, save, token_usage, commit, resume_requested=args.resume)
+        generate, evaluate, approve_unit, log, save, token_usage, commit,
+        resume_requested=args.resume)
     save(state, spath)
     done, total = taskqueue.progress(state["tasks"])
     print(f"\n== estado final: {state['status']} | llamadas a agente: "

@@ -44,8 +44,11 @@ def _execute_gate(gate: dict[str, object], node_id: str,
         shlex.split(cmd), env=env,
         timeout_seconds_value=float(pipeline["runtime"]["gate_timeout_seconds"]))
     try:
-        findings = json.loads(proc.stdout or "{}").get("findings", [])
-    except (json.JSONDecodeError, AttributeError):
+        payload = json.loads(proc.stdout or "")
+        if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
+            raise ValueError("contrato findings ausente")
+        findings = payload["findings"]
+    except (json.JSONDecodeError, AttributeError, ValueError):
         findings = [{
             "file": str(gate["cmd"]).split()[1], "line": 0,
             "rule": "gate-timeout" if timed_out else "gate-roto",
@@ -74,6 +77,23 @@ def _execute_gate(gate: dict[str, object], node_id: str,
         gate=gate["id"], node=node_id, task=task_id,
         returncode=proc.returncode, findings=len(findings), cache_hit=False)
     return report
+
+
+def _safe_run(gate: dict[str, object], node_id: str, workdir: str,
+              pipeline: dict[str, object]) -> dict[str, object]:
+    try:
+        return _run_cached(gate, node_id, workdir, pipeline)
+    except Exception as error:  # noqa: BLE001 - un evaluador roto es fail, no pass
+        return {
+            "gate_id": gate["id"], "name": gate["name"], "node": node_id,
+            "status": "fail", "default_owner": gate["default_owner"],
+            "route_by": gate.get("route_by", "path"),
+            "findings": [{
+                "file": str(gate.get("cmd", "gate")), "line": 0,
+                "rule": "gate-excepcion",
+                "evidence": f"{type(error).__name__}: {error}"[:300],
+            }],
+        }
 
 
 def _review_digest(gate: dict[str, object], node_id: str,
@@ -128,7 +148,7 @@ def run_node_gates(node_id: str, workdir: str,
     reports: list[dict[str, object]] = []
 
     if "G7" in gate_ids:
-        report = _run_cached(registry["G7"], node_id, workdir, pipeline)
+        report = _safe_run(registry["G7"], node_id, workdir, pipeline)
         reports.append(report)
         _save_report(reports_dir, node_id, report)
         if report["status"] == "fail":
@@ -139,7 +159,7 @@ def run_node_gates(node_id: str, workdir: str,
     workers = max(1, int(pipeline["runtime"].get("gate_concurrency", 4)))
     completed: dict[str, dict[str, object]] = {}
     with ThreadPoolExecutor(max_workers=min(workers, max(1, len(deterministic)))) as pool:
-        futures = {pool.submit(_run_cached, registry[gate_id], node_id,
+        futures = {pool.submit(_safe_run, registry[gate_id], node_id,
                                workdir, pipeline): gate_id
                    for gate_id in deterministic}
         for future in as_completed(futures):
@@ -155,7 +175,7 @@ def run_node_gates(node_id: str, workdir: str,
             continue
         if any(report["status"] == "fail" for report in reports):
             continue
-        report = _run_cached(gate, node_id, workdir, pipeline)
+        report = _safe_run(gate, node_id, workdir, pipeline)
         reports.append(report)
         _save_report(reports_dir, node_id, report)
     return reports

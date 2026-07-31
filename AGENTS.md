@@ -1,4 +1,16 @@
-# Codebase discovery policy
+# Repository agent policy
+
+## Mandatory engineering quality
+
+All coding agents, including OpenCode and Codex, MUST read and follow
+`ENGINEERING_QUALITY.md` before creating or modifying code. That document is the
+canonical definition of done for unit tests, regression tests, SOLID review,
+security, maintainability, scalability and fail-closed quality gates. Tool-specific
+instructions may add constraints but may never weaken it.
+
+No code change is complete until applicable tests and gates have been executed
+and their exact results reported. Never bypass, disable or relax a failing test,
+gate, linter, type check or security control to make a change pass.
 
 This repository uses `codebase-memory` as the source of truth for understanding
 the codebase. Apply the following policy to every future coding, debugging,

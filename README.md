@@ -183,6 +183,38 @@ sdd resume --workdir .\project\mi-app\primera-ejecucion
 
 `--autonomous` continúa sin intervención humana y `--node` reanuda un nodo concreto.
 
+### Evaluador-Optimizador integrado
+
+El pipeline usa un único `StateGraph(PipelineState)` durable con
+`AsyncSqliteSaver` en `.agent/checkpoints.sqlite`. Cada unidad de `product`,
+`architect`, `planner`, `dev_backend`, `dev_frontend` y `qa`, incluidas tareas de
+defecto, sigue la topología `generate -> evaluate -> human_review ->
+apply_decision`. La solución se materializa como artefactos o worktree; el estado
+solo persiste referencias, reportes, findings, feedback, intentos e historial de
+iteraciones serializables.
+
+Una evaluación rechazada vuelve al generador/propietario con feedback hasta
+`max_retries_per_gate`; agotado el presupuesto escala explícitamente. Una evaluación
+aprobada siempre alcanza `human_review` antes de commit o integración. En lotes se
+persiste una cola de unidades aprobadas y una sola decisión puede aceptar o rechazar
+el lote sin omitir el punto HITL de cada unidad.
+
+Para aceptar la revisión pendiente:
+
+```console
+sdd resume --workdir .\project\mi-app\primera-ejecucion --decision accept
+```
+
+Para rechazarla y devolver feedback al propietario:
+
+```console
+sdd resume --workdir .\project\mi-app\primera-ejecucion \
+  --decision reject --feedback "Falta cubrir el caso de concurrencia"
+```
+
+`--autonomous`/`--auto-approve-human` generan decisiones `accept` explícitas y
+auditables dentro del mismo nodo; no saltan `evaluate` ni `human_review`.
+
 ## Comandos
 
 | Comando | Propósito |
@@ -393,6 +425,11 @@ tests/
 ```
 
 ## Desarrollo y pruebas
+
+Todo cambio de codigo debe cumplir `ENGINEERING_QUALITY.md`, la definicion
+canonica de terminado compartida por Claude, Codex, Copilot, OpenCode y otros
+asistentes. Exige pruebas unitarias y de regresion, revision SOLID y de seguridad,
+quality gates fail-closed y evidencia de las verificaciones ejecutadas.
 
 ```powershell
 python -m pip install -e .

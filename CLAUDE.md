@@ -4,6 +4,16 @@ Este archivo va en la **raíz del repo objetivo**. Claude Code lo hereda en cada
 sesión; no repitas estas reglas en los prompts. Los identificadores, rutas y
 artefactos permanecen en inglés; la prosa en español.
 
+## Calidad obligatoria para todo cambio
+
+Antes de crear o modificar codigo, lee y aplica `ENGINEERING_QUALITY.md`. Es la
+fuente canonica para pruebas unitarias y de regresion, SOLID, seguridad,
+mantenibilidad, escalabilidad y quality gates fail-closed. Estas reglas son
+obligatorias para Claude y no pueden relajarse desde un prompt de tarea.
+
+Toda entrega debe incluir evidencia de las pruebas y gates ejecutados. Si algo
+falla o no pudo ejecutarse, el cambio no puede presentarse como validado.
+
 ## Principio rector: repo-as-state
 
 Los agentes **no se pasan contexto por chat**. Cada nodo lee y escribe archivos

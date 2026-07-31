@@ -220,6 +220,15 @@ def gather_task(workdir: Path):
         f"  entregables: {', '.join(t.get('deliverables') or []) or '(los que exija el criterio)'}",
         f"  aceptacion:  {t.get('acceptance')}",
     ]
+    feedback = str(t.get("evaluation_feedback") or "").strip()
+    if feedback:
+        lines.append("\n  FEEDBACK DE LA REVISION HUMANA QUE DEBES CORREGIR:")
+        lines.append(f"    {feedback}")
+        for finding in (t.get("findings") or [])[:10]:
+            lines.append(
+                f"    - {finding['file']}:{finding['line']} "
+                f"{finding['rule']} — {finding['evidence']}"
+            )
     if t.get("kind") == "defect":
         lines.append(f"\n  Esta es una TAREA DE DEFECTO abierta por {t.get('gate_id')}. "
                      f"Corrige exactamente esto y nada mas:")

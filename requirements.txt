@@ -2,6 +2,7 @@
 # conserva checkpoints locales; los gates deterministas siguen usando stdlib.
 langgraph>=1.2,<2
 langgraph-checkpoint-sqlite>=3.1,<4
+pydantic>=2.7,<3
 #
 # Validacion de planes y especificaciones YAML:
 PyYAML>=6.0

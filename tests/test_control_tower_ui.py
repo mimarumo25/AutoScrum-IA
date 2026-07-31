@@ -14,6 +14,7 @@ if str(SDD) not in sys.path:
 
 from sdd import server
 from sdd.core import config
+from sdd.control_tower import runtime as tower_runtime
 from sdd.presentation.webpage import PAGE
 
 
@@ -35,8 +36,51 @@ class ControlTowerUiTests(unittest.TestCase):
             'id="resume-failure"', 'id="replay-alert"', 'renderActiveAgents',
             'renderFailure', 'playFailureTone', 'ACTIVE_STATES',
             'setInterval(fetchState,1200)', 'cache:"no-store"',
+            'id="human-review"', 'id="review-evaluation"',
+            'id="review-feedback"', 'id="accept-review"',
+            'id="reject-review"', 'renderHumanReview',
+            'resumeTask(STATE.project,STATE.task,"accept")',
         ):
             self.assertIn(contract, PAGE)
+
+    def test_payload_expone_evaluacion_humana_pendiente(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            (wd / ".agent").mkdir()
+            (wd / ".agent/state.json").write_text(json.dumps({
+                "status": "waiting_human", "cursor": "human_review",
+                "pending_review": {"kind": "unit", "unit_ids": ["product:linear"]},
+                "evaluation": {"approved": True, "feedback": "",
+                               "findings": [], "node": "product"},
+                "history": [], "tasks": [],
+            }), encoding="utf-8")
+            payload = server._view_payload(
+                wd, "waiting_human", "test", "demo", "run")
+        self.assertEqual(payload["pending_review"]["unit_ids"], ["product:linear"])
+        self.assertTrue(payload["evaluation"]["approved"])
+
+    def test_api_rechaza_hitl_sin_decision_y_mantiene_resume_tecnico(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            state_path = wd / ".agent/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({
+                "status": "waiting_human", "cursor": "human_review",
+            }), encoding="utf-8")
+            cfg = {"provider": "test", "model": "", "keys": {"test": ""}}
+            with mock.patch.object(tower_runtime.config, "resolve_output", return_value=wd), \
+                    mock.patch.object(tower_runtime.config, "load", return_value=cfg):
+                with self.assertRaisesRegex(ValueError, "obligatoria"):
+                    tower_runtime.resume({"project": "demo", "task": "run"})
+
+                state_path.write_text(json.dumps({
+                    "status": "escalated", "cursor": "architect",
+                    "pending_review": None,
+                }), encoding="utf-8")
+                with mock.patch.object(tower_runtime.state, "run_update"), \
+                        mock.patch.object(tower_runtime.threading, "Thread") as thread:
+                    tower_runtime.resume({"project": "demo", "task": "run"})
+            self.assertEqual(thread.call_args.kwargs["args"][2], ("--resume",))
 
     def test_native_prompts_cover_v031_contracts(self):
         contracts = {

@@ -236,6 +236,10 @@ class Handler(BaseHTTPRequestHandler):
             workdir = (
                 runtime.resume(body) if self.path == "/resume" else runtime.start(body)
             )
+        except ValueError as error:
+            runtime.release_claim()
+            self._send(400, json.dumps({"error": str(error)}))
+            return
         except Exception as error:  # noqa: BLE001
             runtime.release_claim()
             self._send(500, json.dumps({"error": str(error)}))

@@ -42,7 +42,7 @@ backend, que la cierra y desbloquea a QA.
   ejecutable).
 - **`R1` — revisor crítico, con juicio.** Un modelo lee el trabajo de `product`,
   `architect` y `planner`. Solo puede *añadir* defectos; solo los `blocking` frenan;
-  tope de rondas; si se cae, el gate pasa y lo registra.
+  presupuesto controlado por el orquestador; si se cae, el gate falla cerrado.
 
 ## Reglas de honestidad (el porqué de casi todo)
 

@@ -174,7 +174,16 @@ def resume(body):
     provider = cfg.get("provider") or "anthropic"
     env = env_for(provider, cfg.get("model") or "", cfg["keys"].get(provider, ""))
     env["SDD_APPROVAL_ACTOR"] = "web"
+    decision = str(body.get("decision") or "")
+    feedback = str(body.get("feedback") or "").strip()
     checkpoint = json.loads((workdir / ".agent/state.json").read_text(encoding="utf-8"))
+    if checkpoint.get("status") == "waiting_human" and decision not in {
+            "accept", "reject"}:
+        raise ValueError("decision accept o reject es obligatoria para revision humana")
+    if decision and decision not in {"accept", "reject"}:
+        raise ValueError("decision debe ser accept o reject")
+    if decision == "reject" and not feedback:
+        raise ValueError("feedback es obligatorio al rechazar")
     node = checkpoint.get("cursor", "product")
     state.run_update(
         status="running",
@@ -191,8 +200,13 @@ def resume(body):
             f"Reanudando exactamente desde {node}",
         ),
     )
+    extra = ["--resume"]
+    if decision:
+        extra.extend(("--human-decision", decision))
+    if feedback:
+        extra.extend(("--human-feedback", feedback))
     threading.Thread(
-        target=run_pipeline, args=(workdir, env, ("--resume",)), daemon=True
+        target=run_pipeline, args=(workdir, env, tuple(extra)), daemon=True
     ).start()
     return workdir
 

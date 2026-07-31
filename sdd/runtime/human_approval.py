@@ -29,10 +29,11 @@ def approval_record(workdir: str, actor: str,
     }
 
 
-def rejected_record(actor: str) -> dict[str, object]:
+def rejected_record(actor: str, feedback: str = "") -> dict[str, object]:
     return {
         "approved": False,
         "actor": actor,
+        "feedback": feedback,
         "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 

@@ -181,6 +181,18 @@ def resume(a):
     cmd += ["--from", a.node] if a.node else ["--resume"]
     if getattr(a, "autonomous", False):
         cmd.append("--autonomous")
+    decision = getattr(a, "decision", None)
+    state_path = Path(a.workdir) / ".agent/state.json"
+    if state_path.exists():
+        checkpoint = json.loads(state_path.read_text(encoding="utf-8"))
+        if checkpoint.get("status") == "waiting_human" and not decision:
+            print("una espera humana requiere --decision accept|reject")
+            return 2
+    if decision:
+        cmd += ["--human-decision", decision]
+    feedback = getattr(a, "feedback", "")
+    if feedback:
+        cmd += ["--human-feedback", feedback]
     return subprocess.run(cmd).returncode
 
 
@@ -601,6 +613,10 @@ def build_parser():
         help="nodo concreto; si se omite, continúa desde donde quedó (--resume)")
     s.add_argument("--workdir", required=True)
     s.add_argument("--autonomous", action="store_true", help="reanuda sin intervención humana")
+    s.add_argument("--decision", choices=("accept", "reject"), default=None,
+                   help="decisión para la unidad evaluada pendiente")
+    s.add_argument("--feedback", default="",
+                   help="feedback obligatorio cuando --decision reject")
     s.add_argument("--task", default="Ejecutar el plan de spec/30_plan/tasks.yaml"); s.set_defaults(fn=resume)
     s = sub.add_parser("clean"); s.add_argument("--workdir", default="../demo-repo")
     s.set_defaults(fn=clean)

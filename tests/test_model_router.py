@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
 
 from sdd.integrations import model_router
-from sdd.runtime import orchestrator
+from sdd.runtime import workflow_defects
 
 
 def cfg(*, keys=None, catalog=None, provider="anthropic", model=""):
@@ -105,28 +105,28 @@ class EscalationTest(unittest.TestCase):
         return {"attempts": {}, "status": "running", "cursor": "dev_backend",
                 "defect_seq": 0, "tasks": []}
 
-    @mock.patch.object(orchestrator.taskqueue, "publish_current")
-    @mock.patch.object(orchestrator.lifecycle, "model_escalated")
-    @mock.patch.object(orchestrator.lifecycle, "retried")
+    @mock.patch.object(workflow_defects.taskqueue, "publish_current")
+    @mock.patch.object(workflow_defects.lifecycle, "model_escalated")
+    @mock.patch.object(workflow_defects.lifecycle, "retried")
     def test_cada_tarea_escala_una_sola_vez(self, _retried, _event, _publish):
         task = {"id": "T-1", "node": "dev_backend", "status": "pending"}
         state = self.state()
         finding = [{"file": "src/a.py", "line": 1, "rule": "x", "evidence": "x"}]
         budget = {"max_retries_per_gate": 3, "max_defect_tasks": 12}
         node = {"id": "dev_backend"}
-        orchestrator.handle_defect(
-            state, ".", node, task, "dev_backend", "G4", finding, budget,
-            lambda *_args, **_kwargs: None)
-        orchestrator.handle_defect(
-            state, ".", node, task, "dev_backend", "G4", finding, budget,
-            lambda *_args, **_kwargs: None)
+        for _ in range(2):
+            decision = workflow_defects.classify_defect(
+                state, node, task, "dev_backend", "G4", finding, budget)
+            workflow_defects.retry_defect(
+                state, ".", node, task, decision, budget,
+                lambda *_args, **_kwargs: None)
         self.assertTrue(task["model_escalated"])
         self.assertEqual(task["model_escalation_count"], 1)
         _event.assert_called_once()
 
-    @mock.patch.object(orchestrator.taskqueue, "make_defect")
-    @mock.patch.object(orchestrator.lifecycle, "blocked")
-    @mock.patch.object(orchestrator.lifecycle, "retried")
+    @mock.patch.object(workflow_defects.taskqueue, "make_defect")
+    @mock.patch.object(workflow_defects.lifecycle, "blocked")
+    @mock.patch.object(workflow_defects.lifecycle, "retried")
     def test_fallo_de_otro_propietario_no_consume_escalado(
             self, _retried, _blocked, make_defect):
         task = {"id": "T-2", "node": "qa", "status": "pending"}
@@ -134,9 +134,11 @@ class EscalationTest(unittest.TestCase):
         state["tasks"] = [task]
         make_defect.return_value = {"id": "D-001"}
         finding = [{"file": "src/a.py", "line": 1, "rule": "x", "evidence": "x"}]
-        orchestrator.handle_defect(
-            state, ".", {"id": "qa"}, task, "dev_backend", "R2", finding,
-            {"max_retries_per_gate": 3, "max_defect_tasks": 12},
+        budget = {"max_retries_per_gate": 3, "max_defect_tasks": 12}
+        decision = workflow_defects.classify_defect(
+            state, {"id": "qa"}, task, "dev_backend", "R2", finding, budget)
+        workflow_defects.delegate_defect(
+            state, ".", {"id": "qa"}, task, decision, budget,
             lambda *_args, **_kwargs: None)
         self.assertNotIn("model_escalated", task)
 

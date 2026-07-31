@@ -83,15 +83,15 @@ default_owner = "planner"
 # CATEGORIA DISTINTA. Los G* son codigo determinista sin juicio. Los R* son un
 # modelo juzgando el trabajo de otro modelo. Cumplen el mismo contrato de salida,
 # pero estan acotados: corren al final, solo si los G* del nodo estan verdes, solo
-# los hallazgos 'blocking' frenan, y tienen tope de rondas. Solo pueden ANADIR
-# defectos; ninguno puede relajar un gate determinista.
+# los hallazgos 'blocking' frenan. El presupuesto de reintentos vive unicamente en
+# el orquestador. Solo pueden ANADIR defectos; nunca relajan un gate determinista.
 
 [[gate]]
 id = "R1"
 name = "revision critica de especificacion"
 route_by = "node"          # el defecto vuelve al nodo que produjo el artefacto
 skip_if_prior_failed = true  # no se critica lo que ya se sabe roto: cuesta tokens
-cmd = "{py} {gates}/check_review.py --workdir {workdir} --node {node} --max-rounds 2 --prompt {root}/agents/reviewer.md --label R1"
+cmd = "{py} {gates}/check_review.py --workdir {workdir} --node {node} --prompt {root}/agents/reviewer.md --label R1"
 default_owner = "product"
 
 [[gate]]
@@ -101,5 +101,5 @@ name = "revision critica de codigo"
 # se lleva por tarea. En modo real cuesta una llamada al modelo por tarea de codigo.
 route_by = "node"
 skip_if_prior_failed = true
-cmd = "{py} {gates}/check_review.py --workdir {workdir} --node {node} --max-rounds 2 --prompt {root}/agents/reviewer.md --label R2"
+cmd = "{py} {gates}/check_review.py --workdir {workdir} --node {node} --prompt {root}/agents/reviewer.md --label R2"
 default_owner = "dev_backend"

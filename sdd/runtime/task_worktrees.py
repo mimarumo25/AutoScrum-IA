@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 from sdd.core import process_control
+from sdd.runtime.artifact_integrity import allowed_roots
 
 
 def _git(repo: str | Path, *args: str, data: bytes | None = None):
@@ -29,13 +30,9 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
 
 
 def _footprint(task: dict[str, object],
-               nodes: dict[str, dict[str, object]]) -> list[str]:
-    declared = [str(path).rstrip("/") for path in task.get("deliverables", [])
-                if str(path).strip()]
-    if declared:
-        return declared
+                nodes: dict[str, dict[str, object]]) -> list[str]:
     node = nodes.get(str(task.get("node")), {})
-    return [str(path).rstrip("/") for path in node.get("writes", [])]
+    return allowed_roots(node, task)
 
 
 def _overlaps(left: list[str], right: list[str]) -> bool:
@@ -128,10 +125,9 @@ def preserve(task: dict[str, object], allowed: list[str]) -> None:
 def _allowed(path: str, allowed: list[str]) -> bool:
     normalized = path.replace("\\", "/")
     for raw in allowed:
-        prefix = raw.replace("\\", "/")
-        if prefix.endswith("/") and normalized.startswith(prefix):
-            return True
-        if normalized == prefix or normalized.startswith(prefix + "."):
+        prefix = raw.replace("\\", "/").rstrip("/")
+        if (normalized == prefix or normalized.startswith(prefix + "/")
+                or normalized.startswith(prefix + ".")):
             return True
     return False
 

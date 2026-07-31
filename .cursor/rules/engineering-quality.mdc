@@ -1,0 +1,9 @@
+---
+description: Mandatory engineering quality, tests, SOLID and security
+alwaysApply: true
+---
+
+Read and follow `ENGINEERING_QUALITY.md` and `AGENTS.md` for every code change.
+Create or update unit tests for changed behavior, add regression tests for bugs,
+review SOLID/maintainability/scalability/security, and run every applicable
+quality gate. Gates are fail-closed and must never be bypassed or weakened.

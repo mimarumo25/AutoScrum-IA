@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "gates"))
 
 from sdd.integrations import providers
-from sdd.runtime import orchestrator, taskqueue
+from sdd.runtime import orchestrator, run_state, taskqueue, workflow_defects
 
 PY = sys.executable
 CFG = tomllib.loads((ROOT / "pipeline.toml").read_text(encoding="utf-8"))
@@ -92,7 +92,24 @@ class OrchestratorCase(unittest.TestCase):
         """
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            orchestrator.step(self.state, self.args, CFG, NODES, auto_human=True)
+            orchestrator.generate(self.state, self.args, CFG, NODES, True)
+            if self.state["status"] == "running":
+                orchestrator.evaluate(self.state, self.args, CFG, NODES, True)
+                evaluation = self.state["evaluation"]
+                if evaluation["approved"]:
+                    orchestrator.approve_unit(self.state, self.args, CFG, NODES)
+                else:
+                    node, task = orchestrator._active_unit(self.state, NODES)
+                    decision = workflow_defects.classify_defect(
+                        self.state, node, task, evaluation["owner"],
+                        evaluation["gate_id"], evaluation["findings"], CFG["budget"])
+                    operation = {
+                        "retry": workflow_defects.retry_defect,
+                        "delegate": workflow_defects.delegate_defect,
+                        "escalate": workflow_defects.escalate_defect,
+                    }[decision["route"]]
+                    operation(self.state, self.args.workdir, node, task, decision,
+                              CFG["budget"], orchestrator.log)
         self.salida += buffer.getvalue()
         return self.salida
 
@@ -115,19 +132,10 @@ class TestHonestidadDelOrquestador(OrchestratorCase):
         self.assertEqual(defectos[0]["regla"], "agente-fallido")
         self.assertIn("IncompleteRead", defectos[0]["evidencia"])
 
-    def test_agente_caido_sube_modelo_y_luego_escala(self):
-        # El escalado de modelo concede UN intento extra, no un presupuesto nuevo:
-        # reiniciar attempts convertia max_retries_per_gate en el doble sin tocar
-        # pipeline.toml. Y al no converger el estado es 'escalated' (codigo 1), no
-        # 'waiting_human', que es la pausa firmada del gate humano y sale con 0.
+    def test_agente_caido_agota_el_presupuesto_y_escala(self):
         self.fake_agent(1, "boom")
         for _ in range(CFG["budget"]["max_retries_per_gate"] + 1):
             self.step()
-        self.assertEqual(self.state["status"], "running")
-        self.assertTrue(self.events("MODEL_ESCALATION"))
-
-        # Un solo paso mas basta: el contador de reintentos sigue agotado.
-        self.step()
         self.assertEqual(self.state["status"], "escalated")
         self.assertTrue(self.events("RECUPERACION_EN_ESPERA"))
         self.assertTrue(self.events("ESCALATE_HUMAN"))
@@ -158,7 +166,7 @@ class TestHonestidadDelOrquestador(OrchestratorCase):
             self.step()
         aprobado = self.events("APROBADO")
         self.assertEqual(aprobado[0]["accion"], "commit")
-        self.assertEqual(self.state["cursor"], "architect")
+        self.assertEqual(self.state["approval_next"], "architect")
         log = subprocess.run(["git", "-C", str(self.wd), "log", "--oneline"],
                              capture_output=True, text=True).stdout
         self.assertIn("docs(product)", log)
@@ -265,9 +273,12 @@ class TestColaDeTareas(unittest.TestCase):
             events = []
             emit = lambda _state, event, **fields: events.append((event, fields))
 
-            orchestrator.handle_defect(
-                state, tmp, {"id": "architect"}, None, "product", "G2",
-                finding, {"max_retries_per_gate": 2, "max_defect_tasks": 12}, emit)
+            budget = {"max_retries_per_gate": 2, "max_defect_tasks": 12}
+            decision = workflow_defects.classify_defect(
+                state, {"id": "architect"}, None, "product", "G2",
+                finding, budget)
+            workflow_defects.delegate_defect(
+                state, tmp, {"id": "architect"}, None, decision, budget, emit)
 
             self.assertEqual(state["cursor"], "product")
             self.assertEqual(state["status"], "running")
@@ -282,13 +293,18 @@ class TestColaDeTareas(unittest.TestCase):
                     state, tmp, {"id": "product", "next": "architect", "writes": []},
                     None, emit)
 
-            self.assertEqual(state["cursor"], "architect")
+            self.assertEqual(state["approval_next"], "architect")
             self.assertEqual(state["recoveries"][0]["status"], "corrected")
+            self.assertNotIn("product:G2", state["attempts"])
+            later = workflow_defects.classify_defect(
+                state, {"id": "product"}, None, "product", "G2",
+                finding, budget)
+            self.assertEqual(later["attempt"], 1)
             self.assertIn("CORRECCION_RECIBIDA", [event for event, _ in events])
 
     def test_agotar_reintentos_lineales_sube_modelo_antes_de_pedir_ayuda(self):
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(orchestrator.config, "load", return_value={
+                mock.patch.object(workflow_defects.config, "load", return_value={
                     "routing": {"max_frontier_escalations_per_task": 1}}):
             state = {"attempts": {"architect:G2": 2}, "status": "running",
                      "cursor": "architect", "defect_seq": 0, "tasks": [],
@@ -298,25 +314,15 @@ class TestColaDeTareas(unittest.TestCase):
             emit = lambda *_args, **_kwargs: None
             budget = {"max_retries_per_gate": 2, "max_defect_tasks": 12}
 
-            orchestrator.handle_defect(
-                state, tmp, {"id": "architect"}, None, "architect", "G2",
-                finding, budget, emit)
+            decision = workflow_defects.classify_defect(
+                state, {"id": "architect"}, None, "architect", "G2",
+                finding, budget)
+            workflow_defects.escalate_defect(
+                state, tmp, {"id": "architect"}, None, decision, budget, emit)
 
-            self.assertEqual(state["status"], "running")
-            self.assertTrue(state["recoveries"][0]["model_escalated"])
-            # El escalado NO reinicia el contador de reintentos: hacerlo relajaria
-            # max_retries_per_gate sin tocar pipeline.toml. El intento en el que se
-            # escala ya esta consumido.
-            self.assertEqual(state["attempts"]["architect:G2"], 3)
-
-            state["attempts"]["architect:G2"] = 2
-            orchestrator.handle_defect(
-                state, tmp, {"id": "architect"}, None, "architect", "G2",
-                finding, budget, emit)
-            # Agotado el unico escalado permitido: escalated (codigo 1), no la pausa
-            # firmada waiting_human (codigo 0).
             self.assertEqual(state["status"], "escalated")
             self.assertEqual(state["recoveries"][0]["status"], "needs_input")
+            self.assertEqual(state["attempts"]["architect:G2"], 3)
 
     def test_reintentos_de_tarea_crean_correccion_sin_escalar_proyecto(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,9 +334,12 @@ class TestColaDeTareas(unittest.TestCase):
             finding = [{"file": "src/api/a.py", "line": 2,
                         "rule": "lint", "evidence": "fallo"}]
 
-            orchestrator.handle_defect(
-                state, tmp, {"id": "dev_backend"}, task, "dev_backend", "G4",
-                finding, {"max_retries_per_gate": 2, "max_defect_tasks": 12},
+            budget = {"max_retries_per_gate": 2, "max_defect_tasks": 12}
+            decision = workflow_defects.classify_defect(
+                state, {"id": "dev_backend"}, task, "dev_backend", "G4",
+                finding, budget)
+            workflow_defects.delegate_defect(
+                state, tmp, {"id": "dev_backend"}, task, decision, budget,
                 lambda *_args, **_kwargs: None)
 
             self.assertEqual(state["status"], "running")
@@ -486,14 +495,21 @@ class TestCorridaCompleta(unittest.TestCase):
 
             parada = subprocess.run(base, capture_output=True, text=True)
             self.assertIn("estado final: waiting_human", parada.stdout)
-            self.assertTrue((wd / "spec/30_plan/tasks.yaml").exists(),
-                            "el humano debe poder revisar el plan, no solo la spec")
+            state = json.loads((wd / ".agent/state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["pending_review"]["unit_ids"], ["product:linear"])
             self.assertFalse((wd / "src").exists(), "no se escribe codigo antes de la firma")
 
-            sigue = subprocess.run(base + ["--from", "task_loop"],
-                                   capture_output=True, text=True)
-            self.assertEqual(sigue.returncode, 0, (sigue.stdout + sigue.stderr)[-2000:])
-            self.assertIn("tareas: 5/5", sigue.stdout)
+            salida = ""
+            for _ in range(12):
+                sigue = subprocess.run(
+                    base + ["--resume", "--human-decision", "accept"],
+                    capture_output=True, text=True)
+                salida += sigue.stdout + sigue.stderr
+                state = json.loads((wd / ".agent/state.json").read_text(encoding="utf-8"))
+                if state["status"] == "done":
+                    break
+            self.assertEqual(state["status"], "done", salida[-2000:])
+            self.assertIn("tareas: 5/5", salida)
 
 
 class TestReanudar(unittest.TestCase):
@@ -522,7 +538,7 @@ class TestReanudar(unittest.TestCase):
             "worker_task_id": "T-003", "current_task": "T-003",
         }
 
-        previous = orchestrator.prepare_resume(state)
+        previous = run_state.prepare_resume(state)
 
         self.assertEqual(previous, "escalated")
         self.assertEqual(state["status"], "running")
@@ -540,7 +556,7 @@ class TestReanudar(unittest.TestCase):
             "attempts": {"architect:G2": 3}, "current_task": None,
         }
 
-        previous = orchestrator.prepare_resume(state)
+        previous = run_state.prepare_resume(state)
 
         self.assertEqual(previous, "escalated")
         self.assertEqual(state["cursor"], "architect")
@@ -570,7 +586,7 @@ class TestReanudar(unittest.TestCase):
             ],
         }
         with tempfile.TemporaryDirectory() as tmp:
-            orchestrator.prepare_resume(state, tmp)
+            run_state.prepare_resume(state, tmp)
             published = json.loads(
                 (Path(tmp) / ".agent/current_task.json").read_text(encoding="utf-8"))
 
@@ -597,7 +613,7 @@ class TestReanudar(unittest.TestCase):
                 return original_replace(source, target)
 
             with patch.object(Path, "replace", flaky_replace), \
-                    patch.object(orchestrator.time, "sleep"):
+                    patch.object(run_state.time, "sleep"):
                 orchestrator.save({"status": "running"}, path)
 
             self.assertEqual(len(calls), 3)
@@ -612,7 +628,7 @@ class TestReanudar(unittest.TestCase):
             "parallel_results": {}, "current_task": None,
         }
 
-        previous = orchestrator.prepare_resume(state)
+        previous = run_state.prepare_resume(state)
 
         self.assertEqual(previous, "running")
         self.assertEqual(state["cursor"], "task_loop")

@@ -4,8 +4,9 @@ import os
 
 from langgraph.types import Send
 
-from sdd.core import chronicle, lifecycle, metrics
+from sdd.core import lifecycle
 from sdd.runtime import plan_analysis, scrum, task_worktrees, taskqueue
+from sdd.runtime.artifact_integrity import allowed_roots, evaluation_matches
 
 
 def _scrum_complete(system: str, user: str, workdir: str) -> str:
@@ -34,20 +35,21 @@ def _scrum_complete(system: str, user: str, workdir: str) -> str:
 class ParallelTasks:
     """Scheduler, workers y colector; el grafo solo conecta sus nodos."""
 
-    def __init__(self, workdir, args, cfg, nodes, auto_human, step_fn,
-                 log_fn, commit_fn, normalize_fn, project_fn):
+    def __init__(self, workdir, args, cfg, nodes, auto_human, generate_fn,
+                 evaluate_fn, log_fn, commit_fn, normalize_fn, project_fn):
         self.workdir = workdir
         self.args = args
         self.cfg = cfg
         self.nodes = nodes
         self.auto_human = auto_human
-        self.step_fn = step_fn
+        self.generate_fn = generate_fn
+        self.evaluate_fn = evaluate_fn
         self.log_fn = log_fn
         self.commit_fn = commit_fn
         self.normalize = normalize_fn
         self.project = project_fn
 
-    def schedule(self, value):
+    def load_reconcile(self, value):
         current = self.normalize(copy.deepcopy(dict(value)))
         reconciled = set(taskqueue.reconcile_completed_defects(current["tasks"]))
         for task in current["tasks"]:
@@ -58,13 +60,20 @@ class ParallelTasks:
                 current["tasks"] = taskqueue.load_plan(self.workdir)
             except taskqueue.PlanError as error:
                 current["status"] = "escalated"
+                current["schedule_route"] = "terminal"
                 self.log_fn(current, "ESCALATE_HUMAN", motivo=str(error))
-                self.project(current)
                 return current
             _, total = taskqueue.progress(current["tasks"])
             self.log_fn(current, "PLAN", tareas=total,
                         nodos=len({task["node"] for task in current["tasks"]}))
+        current["schedule_route"] = "select"
+        return current
 
+    def select_ready(self, value):
+        current = self.normalize(copy.deepcopy(dict(value)))
+        if current.get("status") != "running":
+            current["schedule_route"] = "terminal"
+            return current
         ready = taskqueue.runnable(current["tasks"])
         if not ready:
             pending = taskqueue.pending(current["tasks"])
@@ -82,7 +91,7 @@ class ParallelTasks:
                             motivo=f"no hay tareas ejecutables; esperan correcciones: {blocked}")
                 self.log_fn(current, "ESCALATE_HUMAN", pendientes=len(pending),
                             motivo="ninguna rama puede avanzar sin intervencion")
-            self.project(current)
+            current["schedule_route"] = "terminal"
             return current
 
         slots = max(1, int(self.cfg["runtime"].get("max_concurrency", 3)))
@@ -95,6 +104,20 @@ class ParallelTasks:
                 system, user, str(self.workdir)),
             log_fn=lambda event, **fields: self.log_fn(current, event, **fields))
         batch = task_worktrees.safe_batch(ready, self.nodes, slots)
+        current["ready_task_ids"] = [str(task["id"]) for task in batch]
+        current["schedule_route"] = "prepare"
+        return current
+
+    def prepare_batch(self, value):
+        current = self.normalize(copy.deepcopy(dict(value)))
+        selected = set(current.get("ready_task_ids", []))
+        batch = [task for task in current["tasks"] if str(task["id"]) in selected]
+        if not batch:
+            current["status"] = "escalated"
+            current["schedule_route"] = "terminal"
+            self.log_fn(current, "ESCALATE_HUMAN",
+                        motivo="seleccion de batch vacia o stale")
+            return current
         current["batch_seq"] = int(current.get("batch_seq", 0)) + 1
         batch_id = f"B-{current['batch_seq']:04d}"
         try:
@@ -103,8 +126,8 @@ class ParallelTasks:
                     self.workdir, str(current["run_id"]), task)
         except RuntimeError as error:
             current["status"] = "escalated"
+            current["schedule_route"] = "terminal"
             self.log_fn(current, "ESCALATE_HUMAN", motivo=str(error))
-            self.project(current)
             return current
         current["parallel_batch"] = {
             "id": batch_id,
@@ -112,112 +135,35 @@ class ParallelTasks:
         }
         current["current_task"] = str(batch[0]["id"]) if len(batch) == 1 else None
         current["cursor"] = "parallel_dispatch"
+        current["schedule_route"] = "dispatch"
+        current["ready_task_ids"] = []
         done, total = taskqueue.progress(current["tasks"])
         self.log_fn(current, "BATCH", id=batch_id, tareas=len(batch),
                     avance=f"{done}/{total}",
                     ids=",".join(str(task["id"]) for task in batch))
-        self.project(current)
         return current
+
+    @staticmethod
+    def schedule_route(value):
+        return str(value.get("schedule_route", "terminal"))
 
     def dispatch(self, value):
         batch = value.get("parallel_batch") or {}
         batch_id = str(batch.get("id", ""))
         task_ids = list(batch.get("task_ids", []))
-        # 'size' viaja con cada worker porque cada rama solo ve su propia tarea y sin
-        # ese dato no puede repartirse el presupuesto global de llamadas.
-        return [Send("parallel_worker", {
+        ceiling = int(self.cfg["budget"]["max_agent_calls"])
+        remaining = max(0, ceiling - int(value.get("agent_calls", 0)))
+        base, extra = divmod(remaining, max(1, len(task_ids)))
+        return [Send("work_unit", {
             **copy.deepcopy(dict(value)),
             "worker_task_id": task_id,
             "parallel_batch": {"id": batch_id, "task_ids": [task_id],
-                               "size": len(task_ids)},
-        }) for task_id in task_ids]
+                               "agent_quota": base + (index < extra)},
+            "work_unit_started": False,
+            "work_unit_error": "",
+        }) for index, task_id in enumerate(task_ids)]
 
-    def worker(self, value):
-        parent = self.normalize(copy.deepcopy(dict(value)))
-        task_id = str(parent.get("worker_task_id"))
-        batch_id = str((parent.get("parallel_batch") or {}).get("id"))
-        source = taskqueue.by_id(parent["tasks"], task_id)
-        if source is None:
-            raise RuntimeError(f"{batch_id}: no existe la tarea {task_id}")
-        task = copy.deepcopy(source)
-        workspace = task.get("workspace")
-        if not isinstance(workspace, dict):
-            raise RuntimeError(f"{task_id}: worktree no preparado")
-
-        # El techo max_agent_calls vive en step(), que lo compara contra el contador
-        # del estado que recibe. Con el contador local en 0 el techo global no existia
-        # dentro del sprint: cada worker podia gastar el presupuesto completo, y una
-        # ola de 6 multiplicaba por 6 el gasto autorizado. Cada worker recibe ahora su
-        # parte del presupuesto restante, sembrando el contador para que step() corte
-        # en el punto correcto. El resultado reporta el delta, no el absoluto, para que
-        # collect siga acumulando bien.
-        ceiling = int(self.cfg["budget"]["max_agent_calls"])
-        siblings = max(1, int((parent.get("parallel_batch") or {}).get("size", 1)))
-        remaining = max(0, ceiling - int(parent.get("agent_calls", 0)))
-        share = max(1, remaining // siblings)
-        baseline = max(0, ceiling - share)
-
-        local = copy.deepcopy(parent)
-        local.update(tasks=[task], history=[], attempts={}, agent_calls=baseline,
-                     defect_seq=0, current_task=task_id,
-                     cursor=str(task["node"]), status="running")
-        worker_args = copy.copy(self.args)
-        setattr(worker_args, "workdir", str(workspace["path"]))
-        taskqueue.publish_current(str(workspace["path"]), task)
-        lifecycle.started(self.workdir, task_id, str(task["node"]),
-                          workspace=str(workspace["path"]), batch_id=batch_id)
-
-        # Una excepcion inesperada aqui abortaba el nodo del grafo y con el toda la
-        # ola: las tareas hermanas que ya habian terminado perdian su resultado y
-        # collect fallaba con 'resultado de worker ausente'. Una tarea que revienta
-        # debe degradar a escalated y dejar que el colector la trate, no tumbar el lote.
-        crash = ""
-        try:
-            while local["status"] == "running":
-                active = taskqueue.by_id(local["tasks"], task_id)
-                if active is None or active["status"] == "done":
-                    break
-                if any(item.get("kind") == "defect" for item in local["tasks"]
-                       if item.get("id") != task_id):
-                    break
-                if local["cursor"] == "task_loop":
-                    break
-                setattr(worker_args, "visit_id",
-                        f"{batch_id}-{task_id}-{local['agent_calls']}")
-                self.step_fn(local, worker_args, self.cfg, self.nodes, self.auto_human)
-        except Exception as error:  # noqa: BLE001 — se reporta como resultado, no se traga
-            crash = f"{type(error).__name__}: {error}"[:300]
-            local["status"] = "escalated"
-            lifecycle.blocked(self.workdir, task_id, "worker-crash", "G-WORKER",
-                              [{"file": f"agents/{task['node']}.md", "line": 0,
-                                "rule": "worker-excepcion", "evidence": crash}])
-
-        active = taskqueue.by_id(local["tasks"], task_id) or task
-        node = self.nodes[str(active["node"])]
-        task_worktrees.preserve(
-            active, [str(path) for path in node.get("writes", [])])
-        metrics.transfer(str(workspace["path"]), self.workdir)
-        chronicle.transfer(str(workspace["path"]), self.workdir)
-        defect = next((item for item in local["tasks"]
-                       if item.get("kind") == "defect"), None)
-        if active.get("status") == "done":
-            outcome = "done"
-        elif defect is not None:
-            outcome = "blocked"
-        else:
-            outcome = "escalated"
-        result = {
-            "batch_id": batch_id, "task_id": task_id, "outcome": outcome,
-            "task": active, "defect": defect, "history": local["history"],
-            "attempts": local["attempts"],
-            # Delta, no absoluto: el contador se sembro en 'baseline' para que step()
-            # cortara en el techo global, asi que el gasto real es la diferencia.
-            "agent_calls": max(0, int(local["agent_calls"]) - baseline),
-            "status": local["status"], "crash": crash,
-        }
-        return {"parallel_results": {f"{batch_id}:{task_id}": result}}
-
-    def collect(self, value):
+    def stage_results(self, value):
         current = self.normalize(copy.deepcopy(dict(value)))
         batch = current.get("parallel_batch") or {}
         batch_id = str(batch.get("id", ""))
@@ -227,13 +173,70 @@ class ParallelTasks:
             result = results.get(key)
             if result is None:
                 raise RuntimeError(f"resultado de worker ausente: {key}")
-            if not self._collect_one(current, result):
-                break
-        current.update(parallel_batch=None, worker_task_id=None, current_task=None)
-        current["parallel_results"] = {}
-        if current["status"] == "running":
+            if not result.get("collected"):
+                self._stage_review(current, result)
+        current.update(worker_task_id=None, current_task=None)
+        current["collect_queue"] = sorted(keys)
+        current["review_result_keys"] = []
+        return current
+
+    @staticmethod
+    def route_batch(value):
+        queue = value.get("collect_queue") or []
+        if not queue:
+            return "finish"
+        result = (value.get("parallel_results") or {}).get(str(queue[0])) or {}
+        return {
+            "awaiting_human": "review",
+            "done": "integrate",
+            "blocked": "defect",
+        }.get(str(result.get("outcome")), "escalate")
+
+    def _consume_result(self, value, route):
+        current = self.normalize(copy.deepcopy(dict(value)))
+        key = str((current.get("collect_queue") or [""])[0])
+        result = (current.get("parallel_results") or {}).get(key)
+        if result is None:
+            raise RuntimeError(f"resultado de worker ausente: {key}")
+        if route == "review":
+            current.setdefault("review_result_keys", []).append(key)
+        else:
+            self._collect_one(current, result)
+        current["collect_queue"] = list(current.get("collect_queue") or [])[1:]
+        return current
+
+    def defer_review(self, value):
+        return self._consume_result(value, "review")
+
+    def integrate_result(self, value):
+        return self._consume_result(value, "integrate")
+
+    def defect_result(self, value):
+        return self._consume_result(value, "defect")
+
+    def escalate_result(self, value):
+        return self._consume_result(value, "escalate")
+
+    def finish_batch(self, value):
+        current = self.normalize(copy.deepcopy(dict(value)))
+        results = current.get("parallel_results", {})
+        awaiting = [results[key] for key in current.get("review_result_keys", [])]
+        batch_id = str((current.get("parallel_batch") or {}).get("id", ""))
+        if awaiting and current["status"] == "running":
+            current["pending_review"] = {
+                "kind": "parallel", "batch_id": batch_id,
+                "unit_ids": [str(item["evaluation"]["unit_id"]) for item in awaiting],
+                "task_ids": [str(item["task_id"]) for item in awaiting],
+                "evaluations": [item["evaluation"] for item in awaiting],
+            }
+            current["cursor"] = "human_review"
+        else:
+            current["parallel_batch"] = None
+            current["parallel_results"] = {}
+        if current["status"] == "running" and not awaiting:
             current["cursor"] = "task_loop"
-        self.project(current)
+        current["collect_queue"] = []
+        current["review_result_keys"] = []
         return current
 
     def _collect_one(self, current, result):
@@ -241,17 +244,13 @@ class ParallelTasks:
         task = taskqueue.by_id(current["tasks"], task_id)
         if task is None:
             raise RuntimeError(f"tarea ausente al colectar: {task_id}")
-        task["workspace"] = result["task"].get("workspace")
-        current["agent_calls"] += int(result.get("agent_calls", 0))
-        current["history"].extend(result.get("history", []))
-        for attempt, count in result.get("attempts", {}).items():
-            current["attempts"][attempt] = \
-                current["attempts"].get(attempt, 0) + int(count)
+        if not result.get("collected"):
+            self._stage_review(current, result)
 
         if result["outcome"] == "done":
             node = self.nodes[str(task["node"])]
             status, detail = task_worktrees.integrate(
-                self.workdir, task, [str(path) for path in node.get("writes", [])],
+                self.workdir, task, allowed_roots(node, task),
                 taskqueue.commit_message(str(task["node"]), task), self.commit_fn)
             if status == "error":
                 taskqueue.mark_needs_input(
@@ -328,3 +327,98 @@ class ParallelTasks:
                     nodo=task.get("node", ""), motivo=reason)
         task_worktrees.cleanup(self.workdir, task)
         return True
+
+    def _stage_review(self, current, result):
+        """Fusiona una rama una sola vez, sin integrar su solucion todavia."""
+        task = taskqueue.by_id(current["tasks"], str(result["task_id"]))
+        if task is None:
+            raise RuntimeError(f"tarea ausente al preparar revision: {result['task_id']}")
+        task["workspace"] = result["task"].get("workspace")
+        task["evaluation"] = result.get("evaluation")
+        current["agent_calls"] += int(result.get("agent_calls", 0))
+        current["history"].extend(result.get("history", []))
+        current.setdefault("iterations", []).extend(result.get("iterations", []))
+        for attempt, count in result.get("attempts", {}).items():
+            current["attempts"][attempt] = \
+                current["attempts"].get(attempt, 0) + int(count)
+        result["collected"] = True
+
+    def approve_human(self, value, decision):
+        """Integra todas las unidades aceptadas por la arista HITL."""
+        current = self.normalize(copy.deepcopy(dict(value)))
+        batch = current.get("parallel_batch") or {}
+        batch_id = str(batch.get("id", ""))
+        pending = current.get("pending_review") or {}
+        task_ids = [str(item) for item in pending.get("task_ids", [])]
+        results = current.get("parallel_results", {})
+        actor = str(decision.get("actor") or "human")
+        for task_id in task_ids:
+            task = taskqueue.by_id(current["tasks"], task_id)
+            result = results.get(f"{batch_id}:{task_id}")
+            if task is None or result is None:
+                raise RuntimeError(f"revision durable incompleta para {task_id}")
+            evaluation = result.get("evaluation") or {}
+            workspace = (result.get("task") or {}).get("workspace") or {}
+            if not evaluation_matches(evaluation, str(workspace.get("path", ""))):
+                feedback = ("los artefactos cambiaron despues de la evaluacion; "
+                            "la rama debe reevaluarse")
+                task["status"] = "pending"
+                task["evaluation_feedback"] = feedback
+                task["findings"] = [{
+                    "file": str((evaluation.get("content_roots") or ["."])[0]),
+                    "line": 0, "rule": "contenido-cambio-tras-evaluacion",
+                    "evidence": feedback,
+                }]
+                task_worktrees.cleanup(self.workdir, task)
+                self.log_fn(current, "REEVALUACION_REQUERIDA", tarea=task_id,
+                            motivo=feedback)
+                continue
+            result["outcome"] = "done"
+            self._collect_one(current, result)
+            self.log_fn(current, "APROBACION_HUMANA", unidad=task_id,
+                        actor=actor, decision="accept")
+        return self._finish_human_batch(current)
+
+    def reject_human(self, value, decision):
+        """Devuelve unidades rechazadas sin mezclar el efecto de aprobacion."""
+        current = self.normalize(copy.deepcopy(dict(value)))
+        batch = current.get("parallel_batch") or {}
+        batch_id = str(batch.get("id", ""))
+        pending = current.get("pending_review") or {}
+        task_ids = [str(item) for item in pending.get("task_ids", [])]
+        results = current.get("parallel_results", {})
+        feedback = str(decision.get("feedback") or "")
+        actor = str(decision.get("actor") or "human")
+        for task_id in task_ids:
+            task = taskqueue.by_id(current["tasks"], task_id)
+            result = results.get(f"{batch_id}:{task_id}")
+            if task is None or result is None:
+                raise RuntimeError(f"revision durable incompleta para {task_id}")
+            key = f"{task_id}:H1"
+            current["attempts"][key] = current["attempts"].get(key, 0) + 1
+            current["retry_count"] = current["attempts"][key]
+            task["evaluation_feedback"] = feedback
+            task["findings"] = [{"file": f"agents/{task['node']}.md", "line": 0,
+                                  "rule": "rechazo-humano", "evidence": feedback}]
+            limit = int(self.cfg["budget"]["max_retries_per_gate"])
+            if current["attempts"][key] > limit:
+                taskqueue.mark_needs_input(current["tasks"], task_id,
+                                           "rechazo humano agoto reintentos", "H1")
+                self.log_fn(current, "RAMA_EN_ESPERA", tarea=task_id,
+                            nodo=task["node"], gate="H1",
+                            motivo="rechazo humano agoto reintentos")
+            else:
+                task["status"] = "pending"
+                self.log_fn(current, "ENRUTADO", a=task["node"],
+                            intento=current["attempts"][key], reanuda_en=task_id)
+            task_worktrees.cleanup(self.workdir, task)
+            self.log_fn(current, "APROBACION_HUMANA", unidad=task_id,
+                        actor=actor, decision="reject", feedback=feedback)
+        return self._finish_human_batch(current)
+
+    def _finish_human_batch(self, current):
+        current["pending_review"] = None
+        current["parallel_batch"] = None
+        current["parallel_results"] = {}
+        current["cursor"] = "task_loop"
+        return current

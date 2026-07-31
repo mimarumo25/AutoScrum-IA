@@ -5,8 +5,8 @@ tenerla vigilada. Lo que se verifica aqui es que sus limites se cumplen:
 
   - solo `blocking` frena; `mejora` se registra y deja pasar;
   - una revision limpia no consume presupuesto de rondas;
-  - agotado el tope, se sigue adelante DEJANDO CONSTANCIA;
-  - si el revisor se cae o responde algo ilegible, la corrida continua y se avisa;
+  - no mantiene un segundo presupuesto de convergencia;
+  - si el revisor se cae o responde algo ilegible, falla de forma cerrada;
   - nunca se ejecuta sobre un artefacto que los gates deterministas ya reprobaron,
     y nunca puede volver verde un gate rojo.
 
@@ -69,10 +69,10 @@ class RepoCase(unittest.TestCase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(textwrap.dedent(body).lstrip("\n"), encoding="utf-8")
 
-    def revisar(self, node="product", max_rounds=2, env=None):
+    def revisar(self, node="product", env=None):
         proc = subprocess.run(
             [PY, str(GATES / "check_review.py"), "--workdir", str(self.wd),
-             "--node", node, "--max-rounds", str(max_rounds),
+             "--node", node,
              "--prompt", str(ROOT / "agents/reviewer.md")],
             capture_output=True, text=True,
             env=env if env is not None else sin_credenciales(SDD_SIMULATE="1"))
@@ -115,20 +115,19 @@ class TestParseo(unittest.TestCase):
         self.assertIsNone(error)
         self.assertEqual(hallazgos, [])
 
-    def test_severidad_desconocida_se_degrada_a_mejora(self):
-        # Ante la duda no se bloquea: inventarse una severidad no da poder de veto.
+    def test_severidad_desconocida_es_error_fail_closed(self):
         raw = ('<<<REVIEW>>>{"findings":[{"severity":"critico-urgente",'
                '"file":"a.md","line":1,"rule":"r","evidence":"algo"}]}<<<END>>>')
         hallazgos, error = check_review.parse(raw)
-        self.assertIsNone(error)
-        self.assertEqual(hallazgos[0]["severity"], "mejora")
+        self.assertIn("severity invalida", error)
+        self.assertEqual(hallazgos, [])
 
-    def test_hallazgo_sin_evidencia_se_descarta(self):
+    def test_hallazgo_sin_evidencia_invalida_toda_la_revision(self):
         raw = ('<<<REVIEW>>>{"findings":[{"severity":"blocking","file":"a.md"},'
                '{"severity":"blocking","file":"b.md","evidence":"esto si"}]}<<<END>>>')
-        hallazgos, _ = check_review.parse(raw)
-        self.assertEqual(len(hallazgos), 1)
-        self.assertEqual(hallazgos[0]["file"], "b.md")
+        hallazgos, error = check_review.parse(raw)
+        self.assertEqual(hallazgos, [])
+        self.assertIn("sin evidencia", error)
 
 
 class TestSeveridad(RepoCase):
@@ -158,34 +157,32 @@ class TestSeveridad(RepoCase):
 
 
 class TestConvergencia(RepoCase):
-    """Un revisor siempre encuentra algo: el tope es lo que garantiza que acabe."""
+    """El revisor no posee un presupuesto paralelo al del orquestador."""
 
-    def test_tope_de_rondas_deja_pasar_dejando_constancia(self):
+    def test_rondas_previas_no_omiten_una_nueva_evaluacion(self):
         p = self.wd / ".agent/review/product.json"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"rounds": 2, "invocations": 2,
                                  "historial": [], "mejoras": [], "nota": ""}),
                      encoding="utf-8")
-        hallazgos, proc = self.revisar("product", max_rounds=2)
+        hallazgos, proc = self.revisar("product")
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(hallazgos, [])
-        self.assertIn("tope de 2 ronda(s)", self.estado()["nota"])
+        self.assertEqual(self.estado()["invocations"], 3)
 
-    def test_con_tope_cero_no_revisa_nada(self):
-        hallazgos, proc = self.revisar("product", max_rounds=0)
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(hallazgos, [])
+    def test_cada_invocacion_ejecuta_la_evaluacion(self):
+        hallazgos, proc = self.revisar("product")
+        self.assertEqual(proc.returncode, 1)
+        self.assertTrue(hallazgos)
 
 
 class TestDegradacion(RepoCase):
-    """Un critico caido no puede tumbar la corrida, pero tampoco pasar en silencio."""
+    """Un critico caido falla de forma cerrada."""
 
-    def test_revisor_sin_proveedor_pasa_y_avisa(self):
-        # Sin API key y sin modo simulado: providers falla. El gate debe dejar
-        # pasar (los G* deterministas siguen sosteniendo la correccion) y avisar.
+    def test_revisor_sin_proveedor_falla_y_avisa(self):
         hallazgos, proc = self.revisar("product", env=sin_credenciales())
-        self.assertEqual(proc.returncode, 0)
-        self.assertEqual(hallazgos, [])
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(hallazgos[0]["rule"], "revision-no-disponible")
         nota = self.estado()["nota"]
         self.assertIn("revision no disponible", nota)
         self.assertIn("R1", proc.stderr)

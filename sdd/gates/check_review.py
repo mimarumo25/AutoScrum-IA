@@ -11,13 +11,10 @@ prefijo R y por eso esta acotado por diseno:
     que ya se sabe rojo;
   - solo los hallazgos `blocking` frenan el pipeline. Los `mejora` se registran y
     salen en el reporte final como backlog;
-  - tope de rondas por nodo. Agotado el tope se sigue adelante DEJANDO CONSTANCIA,
-    porque sobre un artefacto subjetivo un revisor exigente no converge nunca.
+  - el presupuesto de convergencia pertenece exclusivamente al orquestador.
 
-Si el revisor falla o responde algo ilegible, este gate PASA y lo registra en
-.agent/review/<node>.json. Es deliberado: los G* deterministas siguen sosteniendo
-la correccion, y tumbar la corrida porque el critico se cayo cuesta mas de lo que
-protege. Lo que no hace es callarselo — el reporte final lo dice.
+El gate es fail-closed: proveedor ausente, excepcion o salida ilegible producen
+un hallazgo bloqueante. Nunca fabrica un pass cuando no pudo evaluar.
 """
 import argparse
 import json
@@ -196,10 +193,12 @@ def parse(text: str):
     limpios = []
     for f in crudos:
         if not isinstance(f, dict) or not f.get("evidence"):
-            continue
+            return [], "finding invalido o sin evidencia"
         sev = str(f.get("severity", "mejora")).lower()
+        if sev not in SEVERITIES:
+            return [], f"severity invalida: {sev}"
         limpios.append({
-            "severity": sev if sev in SEVERITIES else "mejora",
+            "severity": sev,
             "file": str(f.get("file") or "spec/").replace("\\", "/"),
             "line": int(f["line"]) if str(f.get("line", "")).isdigit() else 0,
             "rule": str(f.get("rule") or "hallazgo-de-revision"),
@@ -212,7 +211,6 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--workdir", required=True)
     p.add_argument("--node", required=True)
-    p.add_argument("--max-rounds", type=int, default=2)
     p.add_argument("--prompt", required=True, help="ruta a agents/reviewer.md")
     p.add_argument("--label", default="R1", help="etiqueta para el log (R1 spec, R2 codigo)")
     a = p.parse_args()
@@ -225,13 +223,6 @@ def main():
     key = f"{a.node}.{task['id']}" if task.get("id") else a.node
     spath = wd / f".agent/review/{key}.json"
     state = load_state(spath)
-
-    if state["rounds"] >= a.max_rounds:
-        state["nota"] = (f"tope de {a.max_rounds} ronda(s) de revision alcanzado; "
-                         f"se continuo sin bloquear")
-        save_state(spath, state)
-        print(f"  [{a.label}] {key}: {state['nota']}", file=sys.stderr)
-        emit([])
 
     system = Path(a.prompt).read_text(encoding="utf-8")
     user = (f"NODO BAJO REVISION: {a.node}"
@@ -246,16 +237,19 @@ def main():
             raw, selection = ask_model(system, user, wd)
             state["model_selection"] = selection
         hallazgos, error = parse(raw)
-    except Exception as e:  # noqa: BLE001 — un critico caido no tumba la corrida
+    except Exception as e:  # noqa: BLE001 — se convierte en hallazgo fail-closed
         hallazgos, error = [], f"{type(e).__name__}: {e}"
 
     state["invocations"] += 1
     if error:
-        # Se pasa, pero queda escrito. El reporte final lo saca a la superficie.
         state["nota"] = f"revision no disponible: {error}"
+        state["historial"].append({"invocacion": state["invocations"],
+                                   "blocking": 1, "mejoras": 0,
+                                   "error": error})
         save_state(spath, state)
         print(f"  [{a.label}] {key}: {state['nota']}", file=sys.stderr)
-        emit([])
+        emit([finding(f"agents/{a.node}.md", 0, "revision-no-disponible",
+                      state["nota"][:400])])
 
     blocking = [f for f in hallazgos if f["severity"] == "blocking"]
     mejoras = [f for f in hallazgos if f["severity"] == "mejora"]
@@ -264,7 +258,7 @@ def main():
     state["historial"].append({"invocacion": state["invocations"],
                                "blocking": len(blocking), "mejoras": len(mejoras)})
     if blocking:
-        state["rounds"] += 1          # solo consume presupuesto la ronda que bloquea
+        state["rounds"] += 1          # contador historico; no limita convergencia
         state["nota"] = ""
     save_state(spath, state)
     print(f"  [{a.label}] {key}: {len(blocking)} blocking, {len(mejoras)} mejora(s)",
