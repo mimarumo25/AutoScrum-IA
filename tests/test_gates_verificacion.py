@@ -171,6 +171,71 @@ class TestG9Suite(RepoCase):
                f"language: python\ndir: .\ntest: {PYNAME} -m unittest discover -s tests\n")
         self.assertEqual(self._g9(), [])
 
+    def _toolchain(self, **pasos):
+        """toolchain.yaml con los pasos dados. Se invocan scripts en vez de
+        comandos con comillas: shlex.split no trata igual las comillas en win."""
+        lineas = ["language: python", "dir: ."]
+        lineas += [f"{paso}: {PYNAME} {orden}" for paso, orden in pasos.items()]
+        self.w("spec/20_arch/toolchain.yaml", "\n".join(lineas) + "\n")
+
+    def test_reporta_todos_los_pasos_rotos_no_solo_el_primero(self):
+        """Antes cortaba en el primer paso rojo.
+
+        En la corrida real de demo-fastapi-fullstack eso produjo 13 defectos en
+        secuencia (lint -> suite -> typecheck -> suite -> lint...) porque cada
+        vuelta destapaba una capa distinta que YA estaba roja. Cada vuelta cuesta
+        una llamada al modelo con todo el contexto reconstruido, asi que ocultar
+        3 de los 4 fallos multiplica por 4 el coste de la misma correccion.
+        """
+        self.w("falla.py", "import sys\nsys.exit(1)\n")
+        self.w("src/domain/regla.py", "def evaluar(x):\n    return 10 / x\n")
+        self.w("tests/test_regla.py", """
+            import unittest
+            from src.domain.regla import evaluar
+
+            class T(unittest.TestCase):
+                def test_cero(self):
+                    evaluar(0)
+        """)
+        self._toolchain(lint="falla.py", typecheck="falla.py",
+                        test="-m unittest discover -s tests")
+        self.assertEqual(rules(self._g9()),
+                         {"lint-rojo", "typecheck-rojo", "suite-roja"})
+
+    def test_instalar_si_corta_el_resto(self):
+        """Sin dependencias, tipar y probar no significan nada: seguir solo
+        produciria hallazgos derivados que despistan al agente."""
+        self.w("falla.py", "import sys\nsys.exit(1)\n")
+        self._toolchain(install="falla.py", lint="falla.py", test="falla.py")
+        self.assertEqual(rules(self._g9()), {"instalacion-fallida"})
+
+    def test_un_binario_ausente_corta_el_resto(self):
+        """Ningun agente arregla escribiendo codigo un binario que falta."""
+        self.w("falla.py", "import sys\nsys.exit(1)\n")
+        self.w("spec/20_arch/toolchain.yaml",
+               "language: python\ndir: .\n"
+               "lint: binario-que-no-existe-jamas check\n"
+               f"test: {PYNAME} falla.py\n")
+        self.assertEqual(rules(self._g9()), {"toolchain-no-disponible"})
+
+    def test_el_veredicto_no_cambia_solo_su_detalle(self):
+        """La propiedad que hace seguro este cambio: para cualquier arbol el
+        pass/fail es identico al de antes. Solo cambia CUANTOS hallazgos trae un
+        fail, nunca si es fail. Un arbol verde con varios pasos sigue pasando."""
+        self.w("pasa.py", "import sys\nsys.exit(0)\n")
+        self.w("src/domain/regla.py", "def evaluar(x):\n    return x + 1\n")
+        self.w("tests/test_regla.py", """
+            import unittest
+            from src.domain.regla import evaluar
+
+            class T(unittest.TestCase):
+                def test_ok(self):
+                    self.assertEqual(evaluar(1), 2)
+        """)
+        self._toolchain(lint="pasa.py", typecheck="pasa.py",
+                        test="-m unittest discover -s tests")
+        self.assertEqual(self._g9(), [])
+
     def test_tabla_de_cobertura_no_culpa_al_backend_por_asercion_de_qa(self):
         self.w("src/api/main.py", "def health():\n    return 'ok'\n")
         self.w("tests/test_ui.py", "def test_ui():\n    assert False\n")

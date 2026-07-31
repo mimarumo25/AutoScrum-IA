@@ -5,7 +5,7 @@ import time
 from langgraph.graph import END, START, StateGraph
 
 from sdd.core import chronicle, lifecycle, metrics
-from sdd.runtime import task_worktrees, taskqueue
+from sdd.runtime import optimized_gates, task_worktrees, taskqueue
 from sdd.runtime.workflow_contracts import Evaluation
 from sdd.runtime.artifact_integrity import allowed_roots, content_hash
 from sdd.runtime.workflow_defects import (classify_defect, delegate_defect,
@@ -202,6 +202,9 @@ class WorkUnitGraph:
                 evaluation["content_hash"] = content_hash(workspace["path"], roots)
             metrics.transfer(str(workspace["path"]), self.workdir)
             chronicle.transfer(str(workspace["path"]), self.workdir)
+            # Sin esto el historial de gates de dev_*/qa muere con el worktree, y
+            # G9 es precisamente el gate cuyo historial hace falta conservar.
+            optimized_gates.transfer_history(str(workspace["path"]), self.workdir)
         defect = next((item for item in current.get("tasks", [])
                        if item.get("kind") == "defect"), None)
         evaluation = current.get("evaluation") or {}

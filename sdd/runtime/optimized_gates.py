@@ -44,11 +44,14 @@ def _execute_gate(gate: dict[str, object], node_id: str,
     proc, timed_out = process_control.run_bounded(
         shlex.split(cmd), env=env,
         timeout_seconds_value=float(pipeline["runtime"]["gate_timeout_seconds"]))
+    meta: dict[str, object] = {}
     try:
         payload = json.loads(proc.stdout or "")
         if not isinstance(payload, dict) or not isinstance(payload.get("findings"), list):
             raise ValueError("contrato findings ausente")
         findings = payload["findings"]
+        if isinstance(payload.get("meta"), dict):
+            meta = payload["meta"]
     except (json.JSONDecodeError, AttributeError, ValueError):
         findings = [{
             "file": str(gate["cmd"]).split()[1], "line": 0,
@@ -72,6 +75,10 @@ def _execute_gate(gate: dict[str, object], node_id: str,
         "default_owner": gate["default_owner"],
         "route_by": gate.get("route_by", "path"), "findings": findings,
     }
+    # Telemetria opcional del checker (G9 adjunta la huella del arbol). No entra
+    # en el veredicto; solo viaja al journal para poder interpretarlo despues.
+    if meta:
+        report["meta"] = meta
     metrics.record(
         workdir, "gate_process",
         duration_ms=round((time.perf_counter() - started) * 1000, 3),
@@ -139,6 +146,103 @@ def _run_cached(gate: dict[str, object], node_id: str, workdir: str,
     return report
 
 
+def transfer_history(source: str | Path, destination: str | Path) -> int:
+    """Agrega los journals de gate de un worktree antes de retirarlo.
+
+    Los nodos del bucle de tareas (dev_*, qa) corren en worktrees efimeros, asi
+    que sus reportes se escriben AHI y desaparecen al limpiarlos — justo los de
+    G9, que es el gate cuyo historial hace falta para diagnosticar. `metrics` y
+    `chronicle` ya se transferian; estos no.
+
+    Se anexa linea por linea, no se copia el archivo: varios workers pueden tener
+    journal del mismo nodo y gate, y sobrescribir perderia el de todos menos uno.
+    Cada linea lleva `at`, asi que el destino es ordenable aunque se intercale.
+    """
+    origen = Path(source) / ".agent/reports"
+    if not origen.is_dir():
+        return 0
+    destino = Path(destination) / ".agent/reports"
+    copiados = 0
+    for path in sorted(origen.glob("*.history.jsonl")):
+        # Normalizado linea a linea: en Windows un write_text deja CRLF y un
+        # os.write deja LF, asi que concatenar los bytes crudos mezcla finales de
+        # linea y mete lineas vacias en un journal que se lee linea a linea.
+        lineas = [line.strip() for line
+                  in path.read_text(encoding="utf-8", errors="replace").splitlines()]
+        objetivo = destino / path.name
+        # Idempotente: un mismo worktree puede transferirse mas de una vez, y una
+        # linea repetida inflaria el conteo de veredictos del diagnostico. Cada
+        # linea lleva `at` con microsegundos, asi que dos identicas son la misma.
+        ya = set()
+        if objetivo.exists():
+            ya = {line.strip() for line
+                  in objetivo.read_text(encoding="utf-8",
+                                        errors="replace").splitlines()}
+        data = "".join(line + "\n" for line in lineas
+                       if line and line not in ya).encode("utf-8")
+        if not data:
+            continue
+        destino.mkdir(parents=True, exist_ok=True)
+        with _HISTORY_LOCK:
+            handle = os.open(objetivo,
+                             os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+            try:
+                os.write(handle, data)
+            finally:
+                os.close(handle)
+        copiados += 1
+    return copiados
+
+
+def diagnose_oscillation(workdir: str, node_id: str,
+                         gate_id: str = "G9") -> dict[str, object]:
+    """Clasifica por que un gate cambio de veredicto sobre la misma unidad.
+
+    Distinguir estas dos causas importa porque tienen remedios opuestos:
+
+      no-determinismo  misma huella de arbol, veredictos distintos. La suite no
+                       es fiable. Mostrarsela al agente le haria corregir contra
+                       ruido, asi que aqui NO ayuda verificar antes.
+      regresion        la huella cambio entre veredictos. Los fallos son reales y
+                       cada vuelta destapa o rompe una capa distinta. Aqui si
+                       ayuda dar mas informacion por vuelta.
+
+    Devuelve conteos, nunca un juicio: si no hay huellas registradas lo dice en
+    vez de suponer. Lee el journal que escribe `_append_history`.
+    """
+    path = (Path(workdir) / ".agent/reports" /
+            f"{node_id}.{gate_id}.history.jsonl")
+    if not path.exists():
+        return {"gate_id": gate_id, "veredictos": 0, "motivo": "sin historial"}
+    entradas: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            entradas.append(item)
+    sin_huella = sum(1 for item in entradas if not item.get("tree_hash"))
+    por_huella: dict[str, set[str]] = {}
+    for item in entradas:
+        huella = str(item.get("tree_hash") or "")
+        if huella:
+            por_huella.setdefault(huella, set()).add(str(item.get("status")))
+    no_deterministas = [h for h, estados in por_huella.items() if len(estados) > 1]
+    cambios = sum(1 for antes, ahora in zip(entradas, entradas[1:])
+                  if antes.get("status") != ahora.get("status"))
+    return {
+        "gate_id": gate_id,
+        "veredictos": len(entradas),
+        "arboles_distintos": len(por_huella),
+        "cambios_de_veredicto": cambios,
+        "huellas_no_deterministas": len(no_deterministas),
+        "sin_huella": sin_huella,
+        "diagnostico": ("no-determinismo" if no_deterministas else
+                        "regresion" if cambios else "estable"),
+    }
+
+
 def run_node_gates(node_id: str, workdir: str,
                    pipeline: dict[str, object]) -> list[dict[str, object]]:
     """Mismo contrato publico del runner original, con concurrencia acotada."""
@@ -203,12 +307,18 @@ def _append_history(directory: Path, node_id: str,
     intercalaria lineas; se escribe con O_APPEND bajo lock, como en metrics.
     """
     findings = report.get("findings") or []
-    line = json.dumps({
+    entrada = {
         "at": time.time(),
         "gate_id": report.get("gate_id"),
         "status": report.get("status"),
         "rules": [str(item.get("rule", "")) for item in findings],
-    }, ensure_ascii=False, separators=(",", ":")) + "\n"
+    }
+    # La huella del arbol es lo que convierte este journal en un diagnostico: dos
+    # veredictos distintos sobre la misma huella son no-determinismo probado.
+    meta = report.get("meta")
+    if isinstance(meta, dict):
+        entrada.update(meta)
+    line = json.dumps(entrada, ensure_ascii=False, separators=(",", ":")) + "\n"
     path = directory / f"{node_id}.{report['gate_id']}.history.jsonl"
     with _HISTORY_LOCK:
         handle = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)

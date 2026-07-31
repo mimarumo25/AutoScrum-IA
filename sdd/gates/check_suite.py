@@ -83,17 +83,24 @@ def blame(output: str, fallback: str) -> str:
     return (non_test or hits)[0]
 
 
-def run(step: str, command: str, cwd: Path, out: list) -> bool:
-    """Ejecuta un paso. Devuelve False si el pipeline no debe seguir evaluando."""
+# Fallos tras los que seguir evaluando no tiene sentido: sin dependencias no se
+# puede tipar ni probar, y un binario ausente, la red caida o un comando colgado
+# no los arregla ningun agente escribiendo codigo.
+HARD_STOP = frozenset({"instalacion-fallida", "toolchain-no-disponible",
+                       "entorno-sin-red", "suite-colgada"})
+
+
+def run(step: str, command: str, cwd: Path, out: list) -> str:
+    """Ejecuta un paso. Devuelve la regla del fallo, o "" si paso."""
     argv = shlex.split(command, posix=(os.name != "nt"))
     if not argv:
-        return True
+        return ""
     exe = shutil.which(argv[0], path=os.environ.get("PATH"))
     if exe is None:
         out.append(finding(TOOLCHAIN, 0, "toolchain-no-disponible",
                            f"'{argv[0]}' no esta en PATH; el paso '{step}' no se pudo "
                            f"ejecutar. Instalalo en la maquina que corre el pipeline."))
-        return False
+        return "toolchain-no-disponible"
     argv[0] = exe
     try:
         proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True,
@@ -101,21 +108,21 @@ def run(step: str, command: str, cwd: Path, out: list) -> bool:
     except subprocess.TimeoutExpired:
         out.append(finding(TOOLCHAIN, 0, "suite-colgada",
                            f"'{command}' excedio {a.timeout}s sin terminar"))
-        return False
+        return "suite-colgada"
     if proc.returncode == 0:
-        return True
+        return ""
     output = (proc.stdout or "") + "\n" + (proc.stderr or "")
     if any(m in output for m in NET_MARKERS):
         out.append(finding(TOOLCHAIN, 0, "entorno-sin-red",
                            f"'{command}' fallo por red: {tail(output, 200)}"))
-        return False
+        return "entorno-sin-red"
     rule = {"install": "instalacion-fallida", "typecheck": "typecheck-rojo",
             "lint": "lint-rojo", "security": "seguridad-rojo",
             "coverage": "cobertura-insuficiente", "test": "suite-roja"}.get(step, "comando-fallido")
     default = {"install": "package.json", "typecheck": TOOLCHAIN}.get(step, TOOLCHAIN)
     out.append(finding(blame(output, default), 0, rule,
                        f"`{command}` salio {proc.returncode}: {tail(output)}"))
-    return False
+    return rule
 
 
 out = []
@@ -164,14 +171,26 @@ if os.environ.get("SDD_G9_CACHE", "1") != "0" and cache.exists() \
     print("  [G9] arbol identico al ultimo verde; suite no reejecutada", file=sys.stderr)
     emit([])
 
+# Se evaluan TODOS los pasos independientes, no solo hasta el primero que falla.
+# Antes se cortaba en el primero: en la corrida real de demo-fastapi-fullstack eso
+# produjo 13 defectos en secuencia (lint -> suite -> typecheck -> suite -> lint...)
+# porque cada vuelta destapaba una capa distinta que ya estaba roja. Cada vuelta
+# cuesta una llamada al modelo con todo el contexto reconstruido, asi que ocultar
+# 3 de los 4 fallos multiplica por 4 el coste de la misma correccion. Instalar,
+# en cambio, SI corta: sin dependencias, tipar y probar no significan nada.
 for step in [s.strip() for s in a.steps.split(",") if s.strip()]:
     command = str(tc.get(step) or "").strip()
     if not command:
         continue          # paso opcional no declarado
-    if not run(step, command, cwd, out):
-        break             # sin instalar no tiene sentido tipar, sin tipar no tiene sentido probar
+    if run(step, command, cwd, out) in HARD_STOP:
+        break
 
 if not out:               # suite en verde: memoriza la huella para no repetirla
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(huella, encoding="utf-8")
-emit(out)
+# La huella viaja con el veredicto. Dos veredictos distintos sobre la MISMA
+# huella son no-determinismo probado; si la huella cambio, es una regresion o
+# una correccion real. Sin este dato hay que suponer cual de las dos es, y en la
+# corrida de demo-fastapi-fullstack (56 ejecuciones, veredicto oscilante) suponer
+# habria llevado a la conclusion contraria a la que dijeron las evidencias.
+emit(out, {"tree_hash": huella})

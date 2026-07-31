@@ -23,7 +23,18 @@ def finding(file, line, rule, evidence):
     return {"file": str(file), "line": line, "rule": rule, "evidence": evidence}
 
 
-def emit(findings):
-    json.dump({"findings": findings}, sys.stdout)
+def emit(findings, meta=None):
+    """Contrato de salida. `meta` es telemetria opcional del checker.
+
+    `meta` NO influye en el veredicto: el exit sigue dependiendo solo de si hay
+    hallazgos. Existe para que un checker pueda adjuntar el dato con el que se
+    interpreta su propio resultado — G9 adjunta la huella del arbol, y asi dos
+    veredictos distintos sobre la MISMA huella delatan no-determinismo en vez de
+    tener que suponerlo.
+    """
+    payload = {"findings": findings}
+    if meta:
+        payload["meta"] = meta
+    json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
     sys.exit(1 if findings else 0)

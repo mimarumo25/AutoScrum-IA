@@ -135,3 +135,155 @@ class TestHistorialDeIntentos(unittest.TestCase):
             self.assertEqual(len(lines), 40)
             for line in lines:
                 json.loads(line)          # cada linea es JSON completo
+
+
+class TestDiagnosticoDeOscilacion(unittest.TestCase):
+    """Un gate que cambia de veredicto sobre la misma unidad tiene dos causas
+    posibles con remedios OPUESTOS, y confundirlas cuesta caro: si es
+    no-determinismo, dar mas informacion al agente le hace corregir contra
+    ruido; si es regresion, es justo lo que necesita."""
+
+    def _journal(self, base, entradas):
+        path = base / ".agent/reports/qa.G9.history.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(e) + "\n" for e in entradas),
+                        encoding="utf-8")
+
+    def test_misma_huella_veredictos_distintos_es_no_determinismo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._journal(base, [
+                {"status": "fail", "tree_hash": "aaa", "rules": ["suite-roja"]},
+                {"status": "pass", "tree_hash": "aaa", "rules": []},
+            ])
+            d = optimized_gates.diagnose_oscillation(str(base), "qa")
+            self.assertEqual(d["diagnostico"], "no-determinismo")
+            self.assertEqual(d["huellas_no_deterministas"], 1)
+
+    def test_huella_distinta_en_cada_veredicto_es_regresion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._journal(base, [
+                {"status": "fail", "tree_hash": "aaa", "rules": ["lint-rojo"]},
+                {"status": "fail", "tree_hash": "bbb", "rules": ["typecheck-rojo"]},
+                {"status": "pass", "tree_hash": "ccc", "rules": []},
+            ])
+            d = optimized_gates.diagnose_oscillation(str(base), "qa")
+            self.assertEqual(d["diagnostico"], "regresion")
+            self.assertEqual(d["huellas_no_deterministas"], 0)
+            self.assertEqual(d["cambios_de_veredicto"], 1)
+
+    def test_sin_cambios_es_estable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._journal(base, [{"status": "pass", "tree_hash": "aaa"}] * 3)
+            self.assertEqual(
+                optimized_gates.diagnose_oscillation(str(base), "qa")["diagnostico"],
+                "estable")
+
+    def test_sin_historial_lo_dice_en_vez_de_suponer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = optimized_gates.diagnose_oscillation(tmp, "qa")
+            self.assertEqual(d["motivo"], "sin historial")
+            self.assertEqual(d["veredictos"], 0)
+
+    def test_entradas_sin_huella_se_cuentan_aparte(self):
+        """Los journals de corridas anteriores a la instrumentacion no llevan
+        huella: no deben clasificarse como estables por omision."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self._journal(base, [{"status": "fail"}, {"status": "pass"}])
+            d = optimized_gates.diagnose_oscillation(str(base), "qa")
+            self.assertEqual(d["sin_huella"], 2)
+            self.assertEqual(d["huellas_no_deterministas"], 0)
+            self.assertEqual(d["diagnostico"], "regresion")
+
+
+class TestTransferenciaDeHistorial(unittest.TestCase):
+    """Los nodos del bucle de tareas corren en worktrees efimeros: sin
+    transferir, su historial de gates muere con el worktree — y G9 solo corre
+    ahi, asi que era exactamente el historial que se perdia."""
+
+    def _escribir(self, base, nombre, entradas):
+        path = base / ".agent/reports" / nombre
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(e) + "\n" for e in entradas),
+                        encoding="utf-8")
+
+    def test_anexa_en_vez_de_sobrescribir(self):
+        """Dos workers pueden tener journal del mismo nodo y gate; copiar el
+        archivo perderia el de todos menos uno."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            destino, w1, w2 = base / "repo", base / "w1", base / "w2"
+            self._escribir(destino, "qa.G9.history.jsonl",
+                           [{"status": "fail", "tree_hash": "aaa"}])
+            self._escribir(w1, "qa.G9.history.jsonl",
+                           [{"status": "fail", "tree_hash": "bbb"}])
+            self._escribir(w2, "qa.G9.history.jsonl",
+                           [{"status": "pass", "tree_hash": "ccc"}])
+            self.assertEqual(optimized_gates.transfer_history(w1, destino), 1)
+            self.assertEqual(optimized_gates.transfer_history(w2, destino), 1)
+            lineas = (destino / ".agent/reports/qa.G9.history.jsonl").read_text(
+                encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lineas), 3)
+            self.assertEqual([json.loads(l)["tree_hash"] for l in lineas],
+                             ["aaa", "bbb", "ccc"])
+
+    def test_solo_transfiere_journals_no_el_reporte_canonico(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            destino, origen = base / "repo", base / "w1"
+            self._escribir(origen, "qa.G9.history.jsonl", [{"status": "pass"}])
+            (origen / ".agent/reports/qa.G9.json").write_text("{}", encoding="utf-8")
+            optimized_gates.transfer_history(origen, destino)
+            self.assertTrue((destino / ".agent/reports/qa.G9.history.jsonl").exists())
+            self.assertFalse((destino / ".agent/reports/qa.G9.json").exists())
+
+    def test_worktree_sin_reportes_no_falla(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.assertEqual(
+                optimized_gates.transfer_history(base / "vacio", base / "repo"), 0)
+
+
+class TestTransferenciaIdempotente(unittest.TestCase):
+    def test_transferir_dos_veces_el_mismo_worktree_no_duplica(self):
+        """Se observo en una corrida real del demo: el mismo worktree se
+        transfiere mas de una vez y la linea repetida inflaba el conteo de
+        veredictos del diagnostico."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            origen = base / "w1"
+            path = origen / ".agent/reports/qa.G9.history.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"at": 1.5, "status": "fail",
+                                        "tree_hash": "aaa"}) + "\n",
+                            encoding="utf-8")
+            destino = base / "repo"
+            optimized_gates.transfer_history(origen, destino)
+            optimized_gates.transfer_history(origen, destino)
+            optimized_gates.transfer_history(origen, destino)
+            lineas = (destino / ".agent/reports/qa.G9.history.jsonl").read_text(
+                encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lineas), 1)
+
+    def test_lineas_distintas_del_mismo_gate_si_se_anexan(self):
+        """La deduplicacion no debe tragarse veredictos legitimos distintos."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            origen, destino = base / "w1", base / "repo"
+            path = origen / ".agent/reports/qa.G9.history.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"at": 1.0, "status": "fail"}) + "\n",
+                            encoding="utf-8")
+            optimized_gates.transfer_history(origen, destino)
+            path.write_text(json.dumps({"at": 1.0, "status": "fail"}) + "\n"
+                            + json.dumps({"at": 2.0, "status": "pass"}) + "\n",
+                            encoding="utf-8")
+            optimized_gates.transfer_history(origen, destino)
+            lineas = (destino / ".agent/reports/qa.G9.history.jsonl").read_text(
+                encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lineas), 2)
+            self.assertEqual([json.loads(l)["status"] for l in lineas],
+                             ["fail", "pass"])
