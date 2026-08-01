@@ -22,7 +22,8 @@ def delta(before: PipelineState, after: PipelineState) -> dict[str, object]:
 
 def normalize(state: PipelineState) -> PipelineState:
     defaults = {
-        "tasks": [], "history": [], "attempts": {}, "current_task": None,
+        "tasks": [], "history": [], "attempts": {}, "gate_refunds": {},
+        "current_task": None,
         "resume_at": None, "resume_stack": [], "recoveries": [],
         "recovery_seq": 0, "active_visit": None, "batch_seq": 0,
         "parallel_batch": None, "parallel_results": {}, "worker_task_id": None,

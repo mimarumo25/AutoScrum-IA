@@ -175,6 +175,42 @@ def invoke_agent(node, workdir, cfg, simulate, task, visit_id=""):
     return proc.returncode, err[-220:]
 
 
+def refund_attempts(state, key, budget):
+    """Devuelve el presupuesto de reintentos de un gate que acaba de pasar.
+
+    Un gate que pasa no debe arrastrar rencor: si vuelve a fallar mas tarde por
+    algo distinto, merece presupuesto nuevo. Pero un veredicto que oscila
+    convertia eso en una via de escape del presupuesto, porque cada `pass`
+    intermedio lo devolvia ENTERO y la unidad podia ciclar sin converger. Medido
+    en demo-fastapi-fullstack: `attempts` registraba T-003:G9=5 frente a 56
+    ejecuciones reales de G9, y solo los topes globales (max_agent_calls,
+    max_wall_minutes) acotaron la corrida.
+
+    Solo se CUENTAN los reembolsos que de verdad rescataron a la unidad: los que
+    llegan cuando ya estaba al borde de escalar. Un gate que falla una vez y pasa
+    no consume cuota, porque nunca estuvo en peligro. Sin esa distincion el tope
+    se agotaba en el camino feliz: en el demo `product:G1` llegaba a 2 de 2
+    reembolsos solo por fallar y arreglarse dos veces, y un tercer ciclo
+    legitimo habria escalado sin motivo.
+
+    Agotada la cuota, el contador deja de refinanciarse y la escalacion normal
+    ocurre. El tope sale de `max_retries_per_gate`: no se anade otra perilla que
+    pudiera quedar desincronizada de la primera.
+    """
+    attempts = state.setdefault("attempts", {})
+    if key not in attempts:
+        return False        # paso a la primera: no hay nada que devolver
+    limit = int(budget["max_retries_per_gate"])
+    refunds = state.setdefault("gate_refunds", {})
+    al_borde = int(attempts.get(key, 0)) >= limit
+    if al_borde and int(refunds.get(key, 0)) >= limit:
+        return False        # ya se le rescato demasiadas veces; que escale
+    if al_borde:
+        refunds[key] = int(refunds.get(key, 0)) + 1
+    attempts.pop(key, None)
+    return True
+
+
 def agent_failure_report(node_id, rc, detail):
     """Un agente caido se trata como un gate rojo del propio nodo: mismo camino
     de defecto, mismo contador de reintentos, misma escalacion. No hay atajo."""
@@ -342,7 +378,11 @@ def evaluate(state, args, cfg, nodes, _auto_human=False):
             if r["status"] == "pass":
                 key = (f"{task['id']}:{r['gate_id']}" if task else
                        f"{node['id']}:{r['gate_id']}")
-                state.setdefault("attempts", {}).pop(key, None)
+                if not refund_attempts(state, key, cfg["budget"]) \
+                        and key in state.get("attempts", {}):
+                    log(state, "REEMBOLSO_AGOTADO", unidad=key,
+                        motivo="el gate ya oscilo demasiadas veces; el contador "
+                               "de reintentos deja de refinanciarse")
             if task:
                 lifecycle.gate_result(args.workdir, task["id"],
                                       r["gate_id"], r["status"] == "pass",

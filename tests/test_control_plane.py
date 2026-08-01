@@ -13,7 +13,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
-from sdd.runtime.orchestrator import route
+from sdd.runtime.orchestrator import refund_attempts, route
+from sdd.runtime.run_state import load_state, prepare_resume
+from sdd.runtime.workflow_defects import classify_defect
 
 PY = sys.executable
 
@@ -97,3 +99,98 @@ class TestBudgetEscalation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReembolsoDeReintentos(unittest.TestCase):
+    """Un gate que pasa recupera su presupuesto de reintentos; un gate cuyo
+    veredicto OSCILA no puede recuperarlo indefinidamente.
+
+    Sin tope, cada `pass` intermedio devolvia el presupuesto entero y la unidad
+    ciclaba sin converger. Medido en demo-fastapi-fullstack: attempts registraba
+    T-003:G9=5 frente a 56 ejecuciones reales de G9, y solo los topes globales
+    acotaron la corrida.
+    """
+
+    BUDGET = {"max_retries_per_gate": 2}
+
+    def test_pasar_a_la_primera_no_consume_reembolso(self):
+        """No hay nada que devolver si nunca se gasto: si esto consumiera cuota,
+        un gate sano agotaria el tope de oscilacion sin haber oscilado nunca."""
+        state = {"attempts": {}, "gate_refunds": {}}
+        self.assertFalse(refund_attempts(state, "T-001:G9", self.BUDGET))
+        self.assertEqual(state["gate_refunds"], {})
+
+    def test_el_caso_legitimo_sigue_funcionando(self):
+        """Un gate que fallo, se corrigio y paso debe quedar sin rencor: si vuelve
+        a fallar mas tarde por algo distinto, merece presupuesto nuevo."""
+        state = {"attempts": {"T-001:G4": 2}, "gate_refunds": {}}
+        self.assertTrue(refund_attempts(state, "T-001:G4", self.BUDGET))
+        self.assertNotIn("T-001:G4", state["attempts"])
+        self.assertEqual(state["gate_refunds"]["T-001:G4"], 1)
+
+    def test_un_fallo_aislado_no_consume_cuota_nunca(self):
+        """Solo cuenta el reembolso que RESCATA a la unidad del borde.
+
+        Sin esta distincion el tope se agotaba en el camino feliz: en el demo
+        `product:G1` llegaba a 2 de 2 reembolsos solo por fallar y arreglarse dos
+        veces, y un tercer ciclo legitimo habria escalado sin motivo.
+        """
+        state = {"attempts": {}, "gate_refunds": {}}
+        for ciclo in range(10):
+            state["attempts"]["product:G1"] = 1     # un fallo: nunca al borde
+            self.assertTrue(refund_attempts(state, "product:G1", self.BUDGET),
+                            f"el ciclo {ciclo} del camino feliz se bloqueo")
+        self.assertEqual(state["gate_refunds"], {})
+
+    def test_la_oscilacion_deja_de_refinanciarse(self):
+        state = {"attempts": {}, "gate_refunds": {}}
+        for ciclo in range(1, 3):          # dos reembolsos: el tope es 2
+            state["attempts"]["T-003:G9"] = 2
+            self.assertTrue(refund_attempts(state, "T-003:G9", self.BUDGET),
+                            f"el ciclo {ciclo} debia reembolsarse")
+        state["attempts"]["T-003:G9"] = 2
+        self.assertFalse(refund_attempts(state, "T-003:G9", self.BUDGET))
+        # El contador SOBREVIVE, asi que la escalacion normal puede ocurrir.
+        self.assertEqual(state["attempts"]["T-003:G9"], 2)
+        self.assertEqual(state["gate_refunds"]["T-003:G9"], 2)
+
+    def test_el_tope_es_por_unidad_y_gate_no_global(self):
+        """Que una unidad oscile no debe castigar a otra."""
+        state = {"attempts": {}, "gate_refunds": {"T-003:G9": 2}}
+        state["attempts"]["T-004:G9"] = 2
+        self.assertTrue(refund_attempts(state, "T-004:G9", self.BUDGET))
+        state["attempts"]["T-003:G9"] = 2
+        self.assertFalse(refund_attempts(state, "T-003:G9", self.BUDGET))
+
+    def test_con_cuota_agotada_un_fallo_aislado_sigue_perdonandose(self):
+        """Agotada la cuota, un gate que no esta al borde todavia se reembolsa: el
+        tope frena la oscilacion, no el progreso normal."""
+        state = {"attempts": {"T-003:G9": 1}, "gate_refunds": {"T-003:G9": 2}}
+        self.assertTrue(refund_attempts(state, "T-003:G9", self.BUDGET))
+        self.assertNotIn("T-003:G9", state["attempts"])
+
+    def test_la_escalacion_ocurre_cuando_deja_de_reembolsarse(self):
+        """La consecuencia que importa: con el contador ya no refinanciado, el
+        clasificador declara agotado el presupuesto en vez de ciclar."""
+        state = {"attempts": {"T-003:G9": 2}, "gate_refunds": {"T-003:G9": 2},
+                 "defect_seq": 0}
+        self.assertFalse(refund_attempts(state, "T-003:G9", self.BUDGET))
+        decision = classify_defect(
+            state, {"id": "qa"}, {"id": "T-003", "node": "qa"}, "qa", "G9",
+            [{"file": "src/api/main.py", "line": 0, "rule": "suite-roja",
+              "evidence": "x"}],
+            {"max_retries_per_gate": 2, "max_defect_tasks": 12})
+        self.assertTrue(decision["exhausted"])
+        self.assertEqual(decision["attempt"], 3)
+
+    def test_reanudar_limpia_los_reembolsos(self):
+        """Reanudar da presupuesto fresco. Si los reembolsos sobrevivieran, una
+        corrida reanudada escalaria antes de intentar nada."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state, _ = load_state(tmp, "product")
+            state["status"] = "escalated"
+            state["attempts"] = {"T-003:G9": 2}
+            state["gate_refunds"] = {"T-003:G9": 2}
+            prepare_resume(state, tmp)
+            self.assertEqual(state["attempts"], {})
+            self.assertEqual(state["gate_refunds"], {})

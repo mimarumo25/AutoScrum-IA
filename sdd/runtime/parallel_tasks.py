@@ -341,6 +341,12 @@ class ParallelTasks:
         for attempt, count in result.get("attempts", {}).items():
             current["attempts"][attempt] = \
                 current["attempts"].get(attempt, 0) + int(count)
+        # Los reembolsos se acumulan igual que los intentos: si no volvieran del
+        # worker, cada lote empezaria con tope de oscilacion limpio y la via de
+        # escape seguiria abierta en el camino paralelo.
+        refunds = current.setdefault("gate_refunds", {})
+        for key, count in (result.get("gate_refunds") or {}).items():
+            refunds[key] = refunds.get(key, 0) + int(count)
         result["collected"] = True
 
     def approve_human(self, value, decision):

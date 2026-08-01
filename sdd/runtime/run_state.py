@@ -20,6 +20,7 @@ def load_state(workdir, start):
         "run_id": (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-")
                    + uuid.uuid4().hex[:8]),
         "cursor": start, "status": "running", "attempts": {},
+        "gate_refunds": {},
         "agent_calls": 0, "started_at": time.time(), "tasks": [],
         "current_task": None, "defect_seq": 0, "recovery_seq": 0,
         "recoveries": [], "resume_stack": [], "history": [],
@@ -132,7 +133,11 @@ def prepare_resume(state, workdir=None):
     }
     state["status"] = "running"
     if previous != "waiting_human":
+        # Reanudar da presupuesto fresco, y eso incluye los reembolsos: si no se
+        # limpiaran, una corrida reanudada arrastraria el tope de oscilacion de la
+        # anterior y escalaria antes de intentar nada.
         state["attempts"] = {}
+        state["gate_refunds"] = {}
     state["resume_at"] = None
     if previous_started_at is not None:
         state.setdefault("original_started_at", previous_started_at)

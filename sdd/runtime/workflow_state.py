@@ -19,6 +19,10 @@ class PipelineState(TypedDict, total=False):
     cursor: str
     status: str
     attempts: dict[str, int]
+    # Cuantas veces se le ha devuelto el presupuesto de reintentos a cada
+    # unidad:gate. Un gate que pasa lo recupera, pero no indefinidamente: un
+    # veredicto que oscila convertiria ese reembolso en una via de escape.
+    gate_refunds: dict[str, int]
     agent_calls: int
     started_at: float
     original_started_at: float

@@ -52,7 +52,8 @@ class WorkUnitGraph:
             lifecycle.started(self.workdir, task_id, str(task["node"]),
                               workspace=str(workspace["path"]), batch_id=batch_id)
             current.update(
-                tasks=[task], history=[], attempts={}, agent_calls=baseline,
+                tasks=[task], history=[], attempts={}, gate_refunds={},
+                agent_calls=baseline,
                 defect_seq=0, current_task=task_id, cursor=str(task["node"]),
                 status="running" if quota else "escalated", iterations=[],
                 generation=None, evaluation=None, pending_review=None,
@@ -221,6 +222,7 @@ class WorkUnitGraph:
             "batch_id": batch_id, "task_id": task_id, "outcome": outcome,
             "task": task, "defect": defect, "history": current.get("history", []),
             "attempts": current.get("attempts", {}),
+            "gate_refunds": current.get("gate_refunds", {}),
             "agent_calls": max(0, int(current.get("agent_calls", baseline)) - baseline),
             "status": current.get("status", "escalated"),
             "crash": str(current.get("work_unit_error") or ""),
