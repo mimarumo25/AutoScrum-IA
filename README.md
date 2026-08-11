@@ -4,7 +4,9 @@ AutoScrum es una aplicación local que convierte un objetivo de producto en una 
 
 La aplicación se distribuye como un único paquete Python y puede operarse desde la CLI o desde el **Control Tower** web.
 
-> Versión del paquete: `0.3.1` · Python `>= 3.11`
+> Versión del paquete: `0.3.1` · Python `>= 3.11` · [MIT](LICENSE)
+
+Proyecto open source: las contribuciones son bienvenidas. Antes de abrir un PR, lee [CONTRIBUTING.md](CONTRIBUTING.md) — resume las reglas duras del pipeline (propiedad de paths, gates que no se relajan, qué no toca un agente Dev).
 
 ## Estado actual
 
@@ -26,8 +28,8 @@ La aplicación se distribuye como un único paquete Python y puede operarse desd
 ## Capacidades principales
 
 - **Objetivos ricos:** la nueva ejecución usa un compositor de pantalla completa con títulos, negrita, cursiva, listas, enlaces y contador. El contenido se normaliza a texto compatible con Markdown antes del run.
-- **Historia por iteración:** objetivo, orquestación, subtareas, gates, bloqueos, resultado y artefactos forman un hilo navegable.
-- **Observabilidad multiagente:** una matriz animada muestra agentes en espera, pensando, ejecutando, transmitiendo, completados o en error.
+- **Historial persistido:** cada ejecución conserva objetivo, subtareas, gates, bloqueos, resultados y artefactos para consulta posterior.
+- **Observabilidad multiagente:** Equipo en vivo muestra agentes en espera, pensando, ejecutando, transmitiendo, completados o en error, junto con sus decisiones y traspasos.
 - **Click-to-inspect:** cada agente o tarea abre un drawer con resumen, lifecycle, logs filtrables, I/O y memoria.
 - **Tiempo real:** el navegador recibe snapshots mediante Server-Sent Events (`/events`) y usa polling como fallback.
 - **Configuración modular:** `Configuración → Agentes` permite activar agentes, elegir proveedor/modelo, ajustar temperatura y tokens, editar instrucciones y seleccionar herramientas.
@@ -60,12 +62,72 @@ flowchart LR
     SSE --> UI["Control Tower"]
 ```
 
+### Quién dirige la orquesta
+
+El jefe de la orquesta es `sdd.runtime.orchestrator.main`. No es uno de los agentes de IA, sino código determinista que controla la ejecución completa: adquiere el lease, carga la configuración y el estado, activa el modo autónomo cuando corresponde y entrega el control al grafo.
+
+| Responsabilidad | Componente |
+|---|---|
+| Director general | `sdd.runtime.orchestrator.main` |
+| Cerebro de decisiones y máquina de estados | `sdd.runtime.graph_runtime.run_pipeline` |
+| Partitura: agentes, orden, límites y gates | `sdd/pipeline.toml` |
+| Planificador de tareas paralelas | `ParallelTasks` |
+| Especialistas que producen resultados | Product, Architect, Planner, Backend, Frontend, QA y Reviewer |
+| Inspección de calidad | Evaluadores y gates |
+| Enrutamiento de errores | `classify_defect`: reintentar, delegar o escalar |
+| Memoria autoritativa para reanudación | Checkpoint SQLite de LangGraph |
+| Proyección visible | `.agent/state.json`, logs y Control Tower |
+| Paneles de mando | Web, API y CLI |
+
+Product, Architect y Planner no dirigen el sistema. Son especialistas subordinados al flujo del orquestador.
+
+### Flujo de decisión actual
+
+```mermaid
+flowchart TD
+    U["CLI / API / Control Tower"] --> O["Orchestrator"]
+    O --> C["Carga pipeline.toml, estado y presupuesto"]
+    C --> G["LangGraph"]
+    G --> S{"¿Qué unidad sigue?"}
+    S --> A["Ejecutar agente responsable"]
+    A --> E["Evaluación y gates"]
+    E -->|Aprobado| H{"¿Modo autónomo?"}
+    H -->|Sí| AP["Autoaprobación auditable"]
+    H -->|No| HR["Esperar revisión humana"]
+    E -->|Falló| D{"Clasificar defecto"}
+    D -->|Retry| A
+    D -->|Delegate| OT["Crear corrección para otro agente"]
+    D -->|Escalate| X["Detener con causa accionable"]
+    AP --> K["Commit e integración"]
+    HR -->|Accept| K
+    HR -->|Reject + feedback| D
+    K --> P["Scheduler busca más tareas"]
+    OT --> P
+    P -->|Hay tareas| S
+    P -->|Todo completo| F["Estado done y reporte"]
+```
+
+El funcionamiento esperado es:
+
+1. Una interfaz solicita la ejecución.
+2. El orquestador toma control exclusivo del proyecto.
+3. LangGraph consulta el cursor persistido y selecciona el nodo correspondiente.
+4. El agente responsable produce un resultado.
+5. Otro componente evalúa el resultado; un agente no se aprueba a sí mismo.
+6. Si supera los gates, el resultado se integra y se registra.
+7. Si falla, el orquestador lo devuelve al mismo agente, delega la corrección al propietario o escala cuando se agota el presupuesto.
+8. El scheduler selecciona las siguientes tareas ejecutables y paraleliza únicamente las que no entran en conflicto.
+9. El estado se persiste continuamente para permitir una reanudación exacta.
+10. La ejecución sólo termina en un estado explícito: `done`, `escalated`, `error` o `waiting_human`.
+
+El modo autónomo no significa continuar ciegamente. Permite elegir el siguiente agente, ejecutar trabajo paralelo seguro, autoaprobar únicamente unidades que ya superaron sus gates, reintentar o delegar correcciones y recuperar una corrida desde su checkpoint. Los errores externos, gates fallidos sin solución y límites de presupuesto siguen deteniendo y escalando la ejecución.
+
 ### Fase de especificación
 
 1. `product` produce el PRD y escenarios funcionales.
 2. `architect` define NFR, API, entorno, amenazas y toolchain.
 3. `planner` crea `spec/30_plan/tasks.yaml`.
-4. `human_gate` interrumpe el grafo hasta recibir aprobación.
+4. `human_gate` registra una autoaprobación tras gates verdes en modo autónomo o interrumpe el grafo hasta recibir una decisión en modo manual.
 
 ### Sprint de tareas
 
@@ -97,14 +159,26 @@ sdd web --no-open --port 8770
 
 ### Navegación
 
-- **Vista en vivo:** iteraciones, historia, topología de agentes, subtareas, gates y resultados.
+- **Vista en vivo:** una única sala operativa con agentes, delegaciones, decisiones, conversaciones, entradas, salidas y gates.
 - **Historial:** proyectos y ejecuciones persistidas.
 - **Resultados:** artefactos generados y visor de contenido.
 - **Configuración:** tabs de General, Proveedores, Agentes, Runtime y Seguridad.
 
+### Sala de equipo en vivo
+
+**Equipo en vivo** es la única vista operativa del modo automático. Recibe el estado por SSE y muestra:
+
+- el orquestador en el centro y cada agente alrededor, con su estado y tarea actual;
+- los vínculos de delegación y las correcciones transferidas entre agentes;
+- una conversación cronológica con decisiones, gates, entradas, salidas y artefactos;
+- filtros por decisión, delegación, conversación, E/S y gate;
+- pausa local y seguimiento automático sin detener el workflow.
+
+Los eventos se reconstruyen desde el historial autoritativo y el Chronicle persistido, por lo que también aparecen al abrir o reanudar una ejecución anterior. La transmisión conserva como máximo 80 eventos y extractos de 640 caracteres; omite el `system prompt` y redacta patrones habituales de credenciales. El detalle completo permanece en los journals locales del proyecto.
+
 ### Nueva ejecución
 
-El modal ocupa el viewport y prioriza el campo **Objetivo del workflow**. El editor admite títulos, énfasis, listas y enlaces. También solicita proyecto, nombre de ejecución, proveedor, modelo y API key, y muestra la ruta de salida.
+El modal ocupa el viewport y prioriza el campo **Objetivo del workflow**. El editor admite títulos, énfasis, listas y enlaces. Solo solicita proyecto y nombre de ejecución, muestra la ruta de salida y resume el entorno activo. Proveedor, modelo y credencial se heredan de **Configuración → Proveedores**, que es la única fuente de verdad; el modal ofrece un acceso directo para cambiarlos. El control **Continuar sin revisiones manuales** inicia el workflow en modo autónomo; puede desactivarse para conservar aprobaciones interactivas.
 
 ### Estados de agentes
 
@@ -139,9 +213,10 @@ cd auto_scrum
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e .
+copy .env.example .env    # completa la credencial del proveedor que vayas a usar
 ```
 
-En Linux/macOS: `source .venv/bin/activate`. También se puede usar `python -m sdd <comando>` sin instalar el script global.
+En Linux/macOS: `source .venv/bin/activate` y `cp .env.example .env`. También se puede usar `python -m sdd <comando>` sin instalar el script global. `.env` y `config.json` están en `.gitignore`: ninguno de los dos se sube al repo.
 
 ## Inicio rápido
 
@@ -424,6 +499,14 @@ sdd/
 tests/
 ```
 
+## Contribuir
+
+El punto de entrada para colaboradores es [CONTRIBUTING.md](CONTRIBUTING.md):
+cómo levantar el entorno, qué reglas de propiedad de paths y gates no se
+negocian, y el formato esperado de un PR. `CLAUDE.md` y
+`ENGINEERING_QUALITY.md` son la fuente canónica de esas reglas; `CONTRIBUTING.md`
+es el resumen orientado a quien llega de afuera.
+
 ## Desarrollo y pruebas
 
 Todo cambio de codigo debe cumplir `ENGINEERING_QUALITY.md`, la definicion
@@ -444,7 +527,16 @@ python -m pytest tests\test_ui.py -q
 python -m pytest tests\test_task_loop.py tests\test_langgraph_runtime.py -q
 ```
 
-El proyecto usa `codebase-memory-mcp` y está indexado bajo el nombre `D-Miguel-auto_scrum`. Para entender el sistema conviene empezar por `manage_adr(mode="get")`, que devuelve la arquitectura persistida. Para descubrir código se consulta primero el grafo (`search_graph`, `trace_path`, `get_code_snippet`) y se usa búsqueda textual solo para literales, configuración o cuando el índice sea insuficiente. El protocolo completo, con la tabla de qué herramienta usar en cada caso y las reglas para mantener el índice limpio, está en `CLAUDE.md`.
+Los mantenedores originales usan `codebase-memory-mcp`, un servidor MCP propio
+que indexa el repo como grafo de código (firmas, llamadas, ADR) para acelerar
+la navegación desde Claude Code. Es una herramienta de productividad personal,
+no una dependencia del proyecto: no hace falta tenerla instalada para
+contribuir, correr los tests o pasar los gates. Si la usas, el nombre de
+proyecto esperado y el protocolo de uso están documentados en `CLAUDE.md`.
+
+## Licencia
+
+[MIT](LICENSE). Consulta [CONTRIBUTING.md](CONTRIBUTING.md) antes de tu primer PR.
 
 ## Límites conocidos
 
