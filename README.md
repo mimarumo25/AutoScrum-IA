@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/autoscrum-logo.png" alt="Logo de AutoScrum" width="240">
+</p>
+
 # AutoScrum · SDD Multi-Agent Control Tower
 
 AutoScrum es una aplicación local que convierte un objetivo de producto en una ejecución de ingeniería trazable. Combina un pipeline SDD multiagente sobre LangGraph, gates deterministas, aislamiento Git por tarea, persistencia local y un panel web de observabilidad en tiempo real.
