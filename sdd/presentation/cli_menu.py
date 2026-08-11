@@ -70,9 +70,11 @@ def _menu_run():
             print(cli.C.gray("  cancelado")); return
         task = input("  tarea [tarea-1]: ").strip() or "tarea-1"
         intake = input("  archivo de idea [intake.yaml]: ").strip() or None
+        autonomous = input("  modo autónomo [S/n]: ").strip().lower() not in {"n", "no"}
     except (EOFError, KeyboardInterrupt):
         print(); return
-    cli.run(_ns(project=proj, workdir=None, intake=intake, task=task))
+    cli.run(_ns(project=proj, workdir=None, intake=intake, task=task,
+                autonomous=autonomous))
 
 
 def _menu_projects():

@@ -12,6 +12,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent / "sdd"
 sys.path.insert(0, str(ROOT))
@@ -91,9 +93,11 @@ class TestReport(unittest.TestCase):
 
 
 class TestServer(unittest.TestCase):
-    def test_page_incluye_pestanas_y_sprint(self):
+    def test_page_concentra_operacion_en_equipo_en_vivo(self):
         self.assertIn("data-tab=tasks", server.PAGE)
-        self.assertIn("paintSprint", server.PAGE, "el panel debe renderizar el sprint")
+        self.assertIn('id="team-feed"', server.PAGE)
+        self.assertIn("renderTeamFeed", server.PAGE)
+        self.assertNotIn("paintSprint", server.PAGE)
 
     def test_page_permite_copiar_todo_el_registro(self):
         self.assertIn("id=copylog", server.PAGE)
@@ -137,6 +141,38 @@ class TestCli(unittest.TestCase):
         for cmd in ("demo", "run", "gates", "resume", "show", "view", "web", "test"):
             a = parser.parse_args([cmd] + extra.get(cmd, []))
             self.assertEqual(a.cmd, cmd)
+        autonomous = parser.parse_args(["run", "--project", "demo", "--autonomous"])
+        self.assertTrue(autonomous.autonomous)
+
+    def test_run_publico_propaga_modo_autonomo(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli, "_apply_saved_config"), \
+                mock.patch.object(cli.providers, "describe",
+                                  return_value={"key_present": True}), \
+                mock.patch.object(cli, "_seed_repo", return_value=Path(tmp)), \
+                mock.patch.object(cli.subprocess, "run") as process:
+            process.return_value.returncode = 0
+            result = cli.run(SimpleNamespace(
+                workdir=tmp, project=None, intake=None, task="crear producto",
+                autonomous=True))
+        self.assertEqual(result, 0)
+        self.assertEqual(process.call_args.args[0][-1], "--autonomous")
+
+    def test_resume_autonomo_no_exige_decision_manual(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / ".agent/state.json"
+            state_path.parent.mkdir()
+            state_path.write_text(json.dumps({"status": "waiting_human"}),
+                                  encoding="utf-8")
+            args = SimpleNamespace(
+                workdir=tmp, task="crear producto", node=None, autonomous=True,
+                decision=None, feedback="")
+            with mock.patch.object(cli.subprocess, "run") as process:
+                process.return_value.returncode = 0
+                result = cli.resume(args)
+        self.assertEqual(result, 0)
+        self.assertIn("--resume", process.call_args.args[0])
+        self.assertIn("--autonomous", process.call_args.args[0])
 
     def test_print_review_backlog_muestra_mejoras(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,4 +1,5 @@
 """Pruebas de liveness: contencion y procesos colgados terminan acotados."""
+import os
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,29 @@ class TestBoundedProcesses(unittest.TestCase):
                 node, tmp, cfg, True, "task")
         self.assertEqual(code, 124)
         self.assertIn("tiempo configurado", detail)
+
+    def test_agente_puede_importar_sdd_desde_el_workdir_del_proyecto(self):
+        cfg = {"runtime": {
+            "simulate_cmd": "fake",
+            "agent_cmd": "{py} -m sdd.runtime.agent {node} {workdir}",
+            "agent_timeout_seconds": 1,
+        }}
+        node = {"id": "product", "prompt": "agents/product.md"}
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                orchestrator.os.environ, {"PYTHONPATH": "inherited-path"}), patch.object(
+                process_control, "run_bounded",
+                return_value=(completed, False)) as run_bounded, patch.object(
+                orchestrator.metrics, "record"):
+            code, _detail = orchestrator.invoke_agent(
+                node, tmp, cfg, False, {"id": "task-1"})
+
+        child_env = run_bounded.call_args.kwargs["env"]
+        pythonpath = child_env["PYTHONPATH"].split(os.pathsep)
+        self.assertEqual(code, 0)
+        self.assertEqual(pythonpath[0], str(orchestrator.ROOT.parent))
+        self.assertEqual(pythonpath[1], "inherited-path")
+        self.assertEqual(child_env["PYTHONSAFEPATH"], "1")
 
     def test_gate_timeout_es_rojo_no_excepcion(self):
         gate = {"id": "G0", "name": "x", "cmd": "{py} missing.py",

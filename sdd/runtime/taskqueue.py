@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from sdd.core import lifecycle
+from sdd.runtime import delegation
 
 PLAN_PATH = "spec/30_plan/tasks.yaml"
 CURRENT_PATH = ".agent/current_task.json"
@@ -31,7 +32,7 @@ class PlanError(RuntimeError):
     """El plan no se puede cargar. G10 deberia haberlo impedido antes."""
 
 
-def load_plan(workdir) -> list:
+def load_plan(workdir, cfg=None) -> list:
     """Lee spec/30_plan/tasks.yaml y lo normaliza al estado interno de la cola."""
     path = Path(workdir) / PLAN_PATH
     if not path.exists():
@@ -54,8 +55,14 @@ def load_plan(workdir) -> list:
         "scope": str(t.get("scope") or ""),
         "kind": "plan",
         "status": "pending",
+        "depth": 0,
     } for t in raw if isinstance(t, dict)]
+    budget = (cfg or {}).get("budget", cfg or {})
+    max_depth = int(budget.get(
+        "max_delegation_depth", delegation.DEFAULT_MAX_DEPTH))
     for task in result:
+        delegation.ensure_identity(task)
+        delegation.allow_delegation(task, max_depth)
         lifecycle.created(workdir, task)
     return result
 
@@ -139,6 +146,7 @@ def mark_done(tasks, tid, workdir=None):
                 mark_done(tasks, other["id"], workdir)
             else:
                 other["status"] = "pending"
+    delegation.rollup(tasks, workdir)
 
 
 def reconcile_completed_defects(tasks):
@@ -191,7 +199,13 @@ def make_defect(tasks, owner, gate_id, findings, blocked_task, seq, workdir=None
         "gate_id": gate_id,
         "findings": findings,
         "raised_by": blocked_task["id"] if blocked_task else None,
+        "parent_task_id": blocked_task["id"] if blocked_task else None,
+        "depth": int(blocked_task.get("depth", 0)) + 1 if blocked_task else 0,
     }
+    parent_agent = (blocked_task or {}).get("agent")
+    delegation.ensure_identity(
+        defect, parent_agent if isinstance(parent_agent, dict) else None)
+    delegation.allow_delegation(defect)
     tasks.append(defect)
     if workdir is not None:
         lifecycle.created(workdir, defect)
@@ -204,6 +218,9 @@ def make_defect(tasks, owner, gate_id, findings, blocked_task, seq, workdir=None
 def publish_current(workdir, task):
     """Escribe .agent/current_task.json: el unico canal por el que el agente
     sabe que tarea le toca. Sigue siendo repo-as-state, no contexto por chat."""
+    delegation.ensure_identity(task)
+    if "delegation" not in task:
+        delegation.allow_delegation(task)
     path = Path(workdir) / CURRENT_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(task, indent=2, ensure_ascii=False), encoding="utf-8")

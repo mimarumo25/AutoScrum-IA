@@ -44,6 +44,7 @@ class PipelineState(TypedDict, total=False):
     human_decision: dict[str, object] | None
     generation: dict[str, object] | None
     evaluation: dict[str, object] | None
+    decomposition: dict[str, object] | None
     pending_review: dict[str, object] | None
     defect_decision: dict[str, object] | None
     feedback: str

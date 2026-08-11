@@ -13,8 +13,8 @@ if str(SDD) not in sys.path:
     sys.path.insert(0, str(SDD))
 
 from sdd import server
-from sdd.core import config
 from sdd.control_tower import runtime as tower_runtime
+from sdd.core import chronicle, config
 from sdd.presentation.webpage import PAGE
 
 
@@ -23,7 +23,8 @@ class ControlTowerUiTests(unittest.TestCase):
         for contract in (
             'data-view="workspace"', 'data-view="history"',
             'data-view="results"', 'data-view="settings"',
-            'id="iteration-list"', 'id="canvas-topology"',
+            'id="canvas-operations"', 'id="team-network"',
+            'id="team-feed"', 'id="feed-filters"',
             'id="drawer"', 'id="agent-list"', 'id="agent-editor"',
             'id="drawer-logs"', 'id="drawer-trace"', 'idea-editor', 'editor-toolbar',
             'run-modal-body', 'editorToMarkdown', 'data-editor-command',
@@ -31,17 +32,40 @@ class ControlTowerUiTests(unittest.TestCase):
             'id="routing-preview"', 'id="save-routing"', 'id="discover-models"',
             'Automático por política', '/routing/preview', '/models/discover',
             'aria-label="Inspector de agente"', 'prefers-reduced-motion:reduce',
-            'iterationArtifacts', 'activeOverlay', 'prepareTabs', 'sidebarBackdrop',
-            'overlay-open', 'id="active-agents"', 'id="failure-alert"',
-            'id="resume-failure"', 'id="replay-alert"', 'renderActiveAgents',
+            'activeOverlay', 'prepareTabs', 'sidebarBackdrop',
+            'overlay-open', 'id="failure-alert"',
+            'id="resume-failure"', 'id="replay-alert"',
             'renderFailure', 'playFailureTone', 'ACTIVE_STATES',
             'setInterval(fetchState,1200)', 'cache:"no-store"',
             'id="human-review"', 'id="review-evaluation"',
             'id="review-feedback"', 'id="accept-review"',
             'id="reject-review"', 'renderHumanReview',
             'resumeTask(STATE.project,STATE.task,"accept")',
+            'id="autonomous" type="checkbox" checked',
+            'Continuar sin revisiones manuales',
+            'const body={project,task,autonomous}',
+            'task:$("task").value,autonomous',
+            'id="pause-events"', 'id="follow-events"',
+            'renderOperations', 'renderTeamNetwork', 'renderTeamFeed',
+            'data-field="work-state"', 'working?"Trabajando":phase',
+            'STATE?.observability?.events', 'Equipo en vivo',
+            'id="run-profile"', 'id="run-credential-status"',
+            'id="open-provider-settings"', 'openProviderSettings',
+            'provider=CFG.provider||"anthropic"', 'model=CFG.model||""',
+            'key:""', 'CFG.key_status?.[provider]',
         ):
             self.assertIn(contract, PAGE)
+
+    def test_workspace_no_repite_vistas_ni_configuracion_del_proveedor(self):
+        for obsolete in (
+            'id="iteration-list"', 'id="canvas-tabs"',
+            'id="canvas-story"', 'id="canvas-topology"',
+            'id="canvas-results"', 'id="active-agents"',
+            'id="run-provider"', 'id="run-key"', 'id="model"',
+            'id="new-run-rail"', 'renderTopology', 'renderActiveAgents',
+            'iterationArtifacts', 'SELECTED_ITERATION',
+        ):
+            self.assertNotIn(obsolete, PAGE)
 
     def test_payload_expone_evaluacion_humana_pendiente(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,6 +83,53 @@ class ControlTowerUiTests(unittest.TestCase):
         self.assertEqual(payload["pending_review"]["unit_ids"], ["product:linear"])
         self.assertTrue(payload["evaluation"]["approved"])
 
+    def test_payload_expone_decisiones_delegaciones_y_conversaciones_acotadas(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            (wd / ".agent").mkdir()
+            state = {
+                "status": "running",
+                "cursor": "architect",
+                "tasks": [{"id": "T-01", "node": "architect", "status": "running"}],
+                "recoveries": [{
+                    "id": "R-01", "failed_node": "architect", "owner": "product",
+                    "status": "assigned",
+                }],
+                "history": [
+                    {"t": "2026-01-01T00:00:00+00:00", "event": "AGENTE_INICIO",
+                     "nodo": "architect", "tarea": "T-01", "llamada": 1},
+                    {"t": "2026-01-01T00:00:01+00:00", "event": "CORRECCION_ASIGNADA",
+                     "de": "architect", "a": "product", "gate": "G2"},
+                    {"t": "2026-01-01T00:00:02+00:00", "event": "APROBADO",
+                     "nodo": "product", "accion": "commit"},
+                ],
+            }
+            (wd / ".agent/state.json").write_text(json.dumps(state), encoding="utf-8")
+            chronicle.archive_agent_call(
+                wd, "visit-1", "architect", "T-01",
+                system_prompt="SECRETO INTERNO QUE NO DEBE EXPONERSE",
+                user_prompt="api_key=sk-1234567890ABCDEFGHI entrada " + "x" * 800,
+                response_text="salida " + "y" * 800,
+                stdout_text="", stderr_text="", returncode=0,
+                files_written=["spec/20_arch/ARCHITECTURE.md"], files_skipped=[],
+            )
+
+            payload = server._view_payload(wd, "running", "test", "demo", "run")
+
+        observed = payload["observability"]
+        kinds = {event["kind"] for event in observed["events"]}
+        self.assertTrue({"decision", "delegation", "conversation"}.issubset(kinds))
+        conversation = next(event for event in observed["events"]
+                            if event["kind"] == "conversation")
+        self.assertLessEqual(len(conversation["input"]), 640)
+        self.assertLessEqual(len(conversation["output"]), 640)
+        self.assertNotIn("SECRETO INTERNO", json.dumps(observed))
+        self.assertNotIn("sk-1234567890ABCDEFGHI", json.dumps(observed))
+        self.assertIn({
+            "from": "architect", "to": "product", "kind": "asks_help",
+            "task": "R-01", "state": "assigned",
+        }, observed["relationships"])
+
     def test_api_rechaza_hitl_sin_decision_y_mantiene_resume_tecnico(self):
         with tempfile.TemporaryDirectory() as tmp:
             wd = Path(tmp)
@@ -73,6 +144,16 @@ class ControlTowerUiTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "obligatoria"):
                     tower_runtime.resume({"project": "demo", "task": "run"})
 
+                with mock.patch.object(tower_runtime.state, "run_update"), \
+                        mock.patch.object(tower_runtime.threading, "Thread") as thread:
+                    tower_runtime.resume({
+                        "project": "demo", "task": "run", "autonomous": True,
+                    })
+                self.assertEqual(
+                    thread.call_args.kwargs["args"][2],
+                    ("--resume", "--autonomous"),
+                )
+
                 state_path.write_text(json.dumps({
                     "status": "escalated", "cursor": "architect",
                     "pending_review": None,
@@ -81,6 +162,29 @@ class ControlTowerUiTests(unittest.TestCase):
                         mock.patch.object(tower_runtime.threading, "Thread") as thread:
                     tower_runtime.resume({"project": "demo", "task": "run"})
             self.assertEqual(thread.call_args.kwargs["args"][2], ("--resume",))
+
+    def test_inicio_web_propaga_autonomia_y_rechaza_tipos_ambiguos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = Path(tmp)
+            cfg = {"provider": "test", "model": "", "keys": {"test": "key"}}
+            with mock.patch.object(tower_runtime.config, "resolve_output",
+                                   return_value=wd), \
+                    mock.patch.object(tower_runtime.config, "save"), \
+                    mock.patch.object(tower_runtime.config, "load", return_value=cfg), \
+                    mock.patch.object(tower_runtime, "seed"), \
+                    mock.patch.object(tower_runtime.state, "run_update"), \
+                    mock.patch.object(tower_runtime.threading, "Thread") as thread:
+                tower_runtime.start({
+                    "provider": "test", "project": "demo", "task": "run",
+                    "idea": "crear producto", "autonomous": True,
+                })
+                self.assertEqual(
+                    thread.call_args.kwargs["args"][2], ("--autonomous",))
+                with self.assertRaisesRegex(ValueError, "debe ser boolean"):
+                    tower_runtime.start({
+                        "provider": "test", "project": "demo",
+                        "autonomous": "true",
+                    })
 
     def test_native_prompts_cover_v031_contracts(self):
         contracts = {

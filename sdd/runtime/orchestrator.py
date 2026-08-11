@@ -33,7 +33,7 @@ from sdd.core import chronicle, lifecycle, metrics, process_control, run_lease  
 from sdd.core.execution_journal import invoke_once  # noqa: E402
 from sdd.core.run_lease import RunBusyError  # noqa: E402
 from sdd.presentation.report import write_run_report  # noqa: E402
-from sdd.runtime import graph_runtime, plan_analysis, taskqueue  # noqa: E402
+from sdd.runtime import delegation, graph_runtime, plan_analysis, taskqueue  # noqa: E402
 from sdd.runtime.optimized_gates import run_node_gates  # noqa: E402
 from sdd.runtime import workflow_contracts  # noqa: E402
 from sdd.runtime.workflow_contracts import Evaluation  # noqa: E402
@@ -146,6 +146,11 @@ def invoke_agent(node, workdir, cfg, simulate, task, visit_id=""):
                           prompt=(ROOT / node["prompt"]).as_posix(), task=task)
     task_id = str(task.get("id", "")) if isinstance(task, dict) else ""
     env = os.environ.copy()
+    source_root = str(ROOT.parent)
+    inherited_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (source_root, inherited_pythonpath) if part)
+    env["PYTHONSAFEPATH"] = "1"
     env.update(SDD_METRICS_WORKDIR=str(workdir),
                SDD_METRICS_OPERATION="agent_llm",
                SDD_METRICS_NODE=str(node["id"]),
@@ -212,9 +217,12 @@ def refund_attempts(state, key, budget):
 
 
 def agent_failure_report(node_id, rc, detail):
-    """Un agente caido se trata como un gate rojo del propio nodo: mismo camino
-    de defecto, mismo contador de reintentos, misma escalacion. No hay atajo."""
-    rule = "agente-bloqueado" if rc == 3 else "agente-fallido"
+    """Convierte la caida en gate rojo; fallos externos escalan como entorno."""
+    provider_failure = any(marker in (detail or "").lower() for marker in (
+        "error de proveedor:", "providererror", "chat/completions fallo tras",
+    ))
+    rule = ("agente-bloqueado" if rc == 3 else
+            "proveedor-no-disponible" if provider_failure else "agente-fallido")
     return [{
         "gate_id": "G-AGENT", "name": "ejecucion del agente", "node": node_id,
         "status": "fail", "default_owner": node_id, "route_by": "node",
@@ -258,7 +266,9 @@ def enter_task_loop(state, workdir, log_fn):
 
     state["current_task"] = task["id"]
     taskqueue.publish_current(workdir, task)
-    lifecycle.started(workdir, task["id"], task["node"])
+    lifecycle.started(
+        workdir, task["id"], task["node"],
+        agent_id=str((task.get("agent") or {}).get("id", "")))
     done, total = taskqueue.progress(state["tasks"])
     log_fn(state, "TAREA", id=task["id"], nodo=task["node"],
            avance=f"{done}/{total}", titulo=task["title"][:60])
@@ -323,7 +333,9 @@ def _solution(state, args, node, task):
 def generate(state, args, cfg, nodes, _auto_human=False):
     """Ejecuta solo al productor y registra la solucion materializada."""
     node, task = _active_unit(state, nodes)
-    label = f"{node['id']} · {task['id']}" if task else node["id"]
+    agent = ((task or {}).get("agent") or
+             delegation.identity(task["id"] if task else "linear", node["id"]))
+    label = f"{agent['name']} · {task['id']}" if task else str(agent["name"])
     print(f"\n>> nodo {label}", flush=True)
 
     if state["agent_calls"] >= cfg["budget"]["max_agent_calls"]:
@@ -332,7 +344,7 @@ def generate(state, args, cfg, nodes, _auto_human=False):
         return
 
     state["agent_calls"] += 1
-    log(state, "AGENTE_INICIO", nodo=node["id"],
+    log(state, "AGENTE_INICIO", nodo=node["id"], agente=agent["id"],
         tarea=task["id"] if task else "-", llamada=state["agent_calls"])
     write_baseline(args.workdir)
     rc, detail = invoke_once(
@@ -346,7 +358,7 @@ def generate(state, args, cfg, nodes, _auto_human=False):
                   + (f" · {detail}" if rc != 0 and detail else ""))
     unit_id = f"{node['id']}:{task['id'] if task else 'linear'}"
     generation = {
-        "unit_id": unit_id, "node": node["id"],
+        "unit_id": unit_id, "node": node["id"], "agent": agent,
         "task_id": task["id"] if task else None,
         "returncode": rc, "detail": detail,
         "solution": _solution(state, args, node, task),
@@ -474,7 +486,7 @@ def main():
     existed = (Path(args.workdir) / ".agent/state.json").exists()
     state, spath = load_state(args.workdir, args.start or "product")
     if (args.resume and state.get("status") == "waiting_human"
-            and args.human_decision is None):
+            and args.human_decision is None and not auto_human):
         ap.error("--human-decision accept|reject es obligatorio para reanudar HITL")
     if args.start:
         if state.get("status") == "waiting_human":

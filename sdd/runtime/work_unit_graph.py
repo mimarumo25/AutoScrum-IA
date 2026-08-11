@@ -5,7 +5,7 @@ import time
 from langgraph.graph import END, START, StateGraph
 
 from sdd.core import chronicle, lifecycle, metrics
-from sdd.runtime import optimized_gates, task_worktrees, taskqueue
+from sdd.runtime import delegation, optimized_gates, task_worktrees, taskqueue
 from sdd.runtime.workflow_contracts import Evaluation
 from sdd.runtime.artifact_integrity import allowed_roots, content_hash
 from sdd.runtime.workflow_defects import (classify_defect, delegate_defect,
@@ -50,13 +50,15 @@ class WorkUnitGraph:
             retry_key = f"{task_id}:H1"
             taskqueue.publish_current(str(workspace["path"]), task)
             lifecycle.started(self.workdir, task_id, str(task["node"]),
-                              workspace=str(workspace["path"]), batch_id=batch_id)
+                              workspace=str(workspace["path"]), batch_id=batch_id,
+                              agent_id=str((task.get("agent") or {}).get("id", "")))
             current.update(
                 tasks=[task], history=[], attempts={}, gate_refunds={},
                 agent_calls=baseline,
                 defect_seq=0, current_task=task_id, cursor=str(task["node"]),
                 status="running" if quota else "escalated", iterations=[],
-                generation=None, evaluation=None, pending_review=None,
+                generation=None, evaluation=None, decomposition=None,
+                pending_review=None,
                 human_decision=None, defect_decision=None,
                 feedback=str(task.get("evaluation_feedback") or ""),
                 retry_count=int(value.get("attempts", {}).get(retry_key, 0)),
@@ -111,6 +113,23 @@ class WorkUnitGraph:
                              self.auto_human)
         except Exception as error:  # noqa: BLE001 - la rama escala fail-closed
             current["work_unit_error"] = f"{type(error).__name__}: {error}"[:300]
+        return current
+
+    @staticmethod
+    def after_generate(value: PipelineState) -> str:
+        generation = value.get("generation") or {}
+        return ("decompose" if int(generation.get("returncode", 0))
+                == delegation.RETURN_CODE else "evaluate")
+
+    def decompose(self, value: PipelineState) -> dict[str, object]:
+        """Recoge la propuesta; la validacion con estado global ocurre en fan-in."""
+        current = self.normalize(copy.deepcopy(dict(value)))
+        workspace = current["tasks"][0]["workspace"]
+        try:
+            current["decomposition"] = delegation.read_proposal(workspace["path"])
+        except delegation.DelegationError as error:
+            current["work_unit_error"] = str(error)
+        current["active_visit"] = None
         return current
 
     def evaluate(self, value: PipelineState) -> dict[str, object]:
@@ -209,7 +228,10 @@ class WorkUnitGraph:
         defect = next((item for item in current.get("tasks", [])
                        if item.get("kind") == "defect"), None)
         evaluation = current.get("evaluation") or {}
-        if evaluation.get("approved") and not current.get("work_unit_error"):
+        decomposition = current.get("decomposition")
+        if decomposition and not current.get("work_unit_error"):
+            outcome = "delegated"
+        elif evaluation.get("approved") and not current.get("work_unit_error"):
             outcome = "awaiting_human"
         elif defect is not None:
             outcome = "blocked"
@@ -228,6 +250,7 @@ class WorkUnitGraph:
             "crash": str(current.get("work_unit_error") or ""),
             "evaluation": current.get("evaluation"),
             "generation": current.get("generation"),
+            "decomposition": current.get("decomposition"),
             "iterations": current.get("iterations", []),
         }
         return {"parallel_results": {f"{batch_id}:{task_id}": result}}
@@ -237,6 +260,7 @@ class WorkUnitGraph:
         builder.add_node("prepare", self.prepare)
         builder.add_node("budget_check", self.budget_check)
         builder.add_node("generate", self.generate)
+        builder.add_node("decompose", self.decompose)
         builder.add_node("evaluate", self.evaluate)
         builder.add_node("route", self.route)
         builder.add_node("retry", self.retry)
@@ -248,7 +272,10 @@ class WorkUnitGraph:
         builder.add_conditional_edges("budget_check", self.after_budget, {
             "generate": "generate", "blocked": "route",
         })
-        builder.add_edge("generate", "evaluate")
+        builder.add_conditional_edges("generate", self.after_generate, {
+            "evaluate": "evaluate", "decompose": "decompose",
+        })
+        builder.add_edge("decompose", "finalize")
         builder.add_edge("evaluate", "route")
         builder.add_conditional_edges("route", self.choose_route, {
             "approved": "finalize", "retry": "retry",

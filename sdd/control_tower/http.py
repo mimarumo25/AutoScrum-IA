@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from sdd.core import chronicle, config
+from sdd.core import chronicle, config, lifecycle
 from sdd.integrations import model_router, providers
 from sdd.control_tower import runtime, state, views
 from sdd.presentation.webpage import PAGE
@@ -158,14 +158,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/lifecycle":
             task_id = query.get("task_id", [""])[0]
             payload = (
-                {"tasks": __import__("lifecycle").all_tasks(str(workdir))}
+                {"tasks": lifecycle.all_tasks(str(workdir))}
                 if not task_id
                 else {
-                    "summary": __import__("lifecycle").summary(str(workdir), task_id),
-                    "events": __import__("lifecycle").read(str(workdir), task_id),
-                    "tokens": __import__("lifecycle").total_token_usage_by_task(
-                        str(workdir), task_id
-                    ),
+                    "summary": lifecycle.summary(str(workdir), task_id),
+                    "events": lifecycle.read(str(workdir), task_id),
+                    "tokens": lifecycle.total_token_usage_by_task(str(workdir), task_id),
                 }
             )
         else:

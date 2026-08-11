@@ -119,6 +119,24 @@ class TestIntegratedEvaluationContract(unittest.TestCase):
         self.assertEqual(state["agent_calls"], 1)
         self.assertEqual(state["attempts"], {})
 
+    def test_proveedor_caido_escala_sin_crear_cadena_de_defectos(self):
+        detail = ("[agent] error de proveedor: deepseek chat/completions fallo tras "
+                  "4 intento(s): URLError: connection refused")
+        report = orchestrator.agent_failure_report("dev_backend", 1, detail)[0]
+        finding = report["findings"][0]
+        state = {"attempts": {}, "defect_seq": 1}
+
+        decision = workflow_defects.classify_defect(
+            state, {"id": "dev_backend"}, {"id": "T-001"},
+            "dev_backend", report["gate_id"], [finding],
+            {"max_retries_per_gate": 2, "max_defect_tasks": 12})
+
+        self.assertEqual(finding["rule"], "proveedor-no-disponible")
+        self.assertEqual(decision["route"], "escalate")
+        self.assertTrue(decision["infrastructure"])
+        self.assertEqual(decision["attempt"], 0)
+        self.assertEqual(state["defect_seq"], 1)
+
     def test_checkpoints_usan_durabilidad_sincrona(self):
         source = Path(graph_runtime.__file__).read_text(encoding="utf-8")
         self.assertIn('durability="sync"', source)
@@ -352,6 +370,69 @@ class TestWorktreeRecovery(unittest.TestCase):
                 str(wd), "run-1", {"id": "T-1", "node": "dev"})
             self.assertEqual(reconstructed["path"], first["path"])
             task["workspace"] = first
+            task_worktrees.cleanup(str(wd), task)
+
+    def test_prepare_recupera_merge_conflictivo_con_version_aprobada(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = git_repo(Path(tmp))
+            task = {"id": "T-1", "node": "dev"}
+            task["workspace"] = task_worktrees.prepare(str(wd), "run-1", task)
+            worktree = Path(task["workspace"]["path"])
+
+            (worktree / "shared.py").write_text("VALUE = 'candidato-rojo'\n",
+                                                encoding="utf-8")
+            subprocess.run(["git", "-C", str(worktree), "add", "shared.py"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(worktree), "commit", "-qm", "red"],
+                           check=True, capture_output=True)
+
+            (wd / "shared.py").write_text("VALUE = 'correccion-aprobada'\n",
+                                           encoding="utf-8")
+            subprocess.run(["git", "-C", str(wd), "add", "shared.py"],
+                           check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wd), "commit", "-qm", "approved"],
+                           check=True, capture_output=True)
+            main_head = subprocess.run(
+                ["git", "-C", str(wd), "rev-parse", "HEAD"], check=True,
+                capture_output=True, text=True).stdout.strip()
+
+            conflicted = subprocess.run(
+                ["git", "-C", str(worktree), "merge", "--no-edit", main_head],
+                capture_output=True)
+            self.assertNotEqual(conflicted.returncode, 0)
+
+            refreshed = task_worktrees.prepare(str(wd), "run-1", task)
+
+            self.assertEqual(refreshed["base_commit"], main_head)
+            self.assertEqual((worktree / "shared.py").read_text(encoding="utf-8"),
+                             "VALUE = 'correccion-aprobada'\n")
+            status = subprocess.run(
+                ["git", "-C", str(worktree), "status", "--porcelain"],
+                check=True, capture_output=True, text=True).stdout
+            self.assertEqual(status, "")
+            merge_head = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "-q", "--verify",
+                 "MERGE_HEAD"], capture_output=True)
+            self.assertNotEqual(merge_head.returncode, 0)
+            task_worktrees.cleanup(str(wd), task)
+
+    def test_prepare_no_pisa_cambios_locales_sin_preservar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = git_repo(Path(tmp))
+            task = {"id": "T-1", "node": "dev"}
+            task["workspace"] = task_worktrees.prepare(str(wd), "run-1", task)
+            worktree = Path(task["workspace"]["path"])
+            original = (worktree / ".gitignore").read_text(encoding="utf-8")
+            local = original + "local-only/\n"
+            (worktree / ".gitignore").write_text(local, encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "sin preservar"):
+                task_worktrees.prepare(str(wd), "run-1", task)
+
+            self.assertEqual((worktree / ".gitignore").read_text(encoding="utf-8"),
+                             local)
+            subprocess.run(["git", "-C", str(worktree), "restore", ".gitignore"],
+                           check=True, capture_output=True)
             task_worktrees.cleanup(str(wd), task)
 
     def test_integracion_completada_no_duplica_commit(self):
@@ -614,6 +695,32 @@ class TestDurableHumanGate(unittest.TestCase):
                               for unit in record.get("unit_ids", [])}
             self.assertTrue({"product:linear", "architect:linear", "planner:linear"}
                             <= approved_units)
+
+    def test_resume_autonomo_consume_interrupt_y_converge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd = git_repo(Path(tmp))
+            base = [PY, "-m", "sdd.runtime.orchestrator",
+                    "--workdir", str(wd), "--simulate"]
+            stopped = subprocess.run(base, capture_output=True, text=True)
+            self.assertEqual(stopped.returncode, 0,
+                             stopped.stdout + stopped.stderr)
+            state_path = wd / ".agent/state.json"
+            self.assertEqual(
+                json.loads(state_path.read_text(encoding="utf-8"))["status"],
+                "waiting_human",
+            )
+
+            resumed = subprocess.run(
+                base + ["--resume", "--autonomous"],
+                capture_output=True, text=True,
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(resumed.returncode, 0,
+                         resumed.stdout + resumed.stderr)
+        self.assertEqual(state["status"], "done")
+        self.assertTrue(state["human_approval"]["approved"])
+        self.assertEqual(state["human_approval"]["actor"], "autonomous")
+        self.assertIn("auto-approval explicita", resumed.stdout)
 
     def test_send_workers_ejecutan_batch_paralelo_y_limpian_worktrees(self):
         with tempfile.TemporaryDirectory() as tmp:

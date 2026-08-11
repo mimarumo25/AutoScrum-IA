@@ -7,7 +7,7 @@ from pathlib import Path
 from sdd.core import config, lifecycle
 from sdd.integrations import model_router
 from sdd.presentation import report
-from sdd.control_tower import state
+from sdd.control_tower import agent_instances, observability, state
 from sdd.control_tower.runtime import ROOT
 
 
@@ -28,6 +28,11 @@ def sprint_from(state_path: Path):
             "attention_gate": task.get("attention_gate", ""),
             "model_escalated": bool(task.get("model_escalated")),
             "model_selection": task.get("model_selection") or {},
+            "agent": task.get("agent") or {},
+            "parent_task_id": task.get("parent_task_id"),
+            "child_ids": task.get("child_ids") or [],
+            "depth": int(task.get("depth", 0)),
+            "delegation_reason": task.get("delegation_reason", ""),
         }
         for task in (persisted.get("tasks") or [])
     ]
@@ -405,6 +410,7 @@ def view_payload(workdir, status, provider, project, task, runtime=None):
             raw_state.get("cursor"),
             raw_state.get("recoveries", []),
         ),
+        "agent_instances": agent_instances.project(sprint, summaries),
         "live_tasks": summaries,
         "tokens": tokens,
         "input": idea,
@@ -413,6 +419,7 @@ def view_payload(workdir, status, provider, project, task, runtime=None):
         "pending_review": raw_state.get("pending_review"),
         "evaluation": raw_state.get("evaluation"),
         "recoveries": raw_state.get("recoveries", []),
+        "observability": observability.build(workdir, raw_state, activity),
         "revision": runtime.get("revision", 0),
         "updated_at": runtime.get("updated_at", 0),
         "artifacts": artifact_list(workdir) if workdir else [],

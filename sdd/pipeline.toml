@@ -30,6 +30,9 @@ max_wall_minutes = 180
 max_defect_tasks = 12         # tope de tareas de defecto generadas; evita ping-pong infinito
 max_output_tokens = 0         # techo de tokens de salida (0 = sin techo). En modo real
                               # el orquestador escala si se supera; en simulado no aplica.
+max_delegation_depth = 2      # principal -> hijo -> nieto; luego debe ejecutar o escalar
+max_subtasks_per_task = 6     # evita explosiones de fan-out en una sola decision
+max_delegated_tasks = 24      # techo global de subtareas dinamicas por corrida
 
 # --- Nodos del grafo -------------------------------------------------------
 # writes: paths sobre los que el nodo PUEDE escribir. Todo lo demás es violación
@@ -95,7 +98,10 @@ next = "task_loop"
 id = "dev_backend"
 prompt = "agents/dev_backend.md"
 task_node = true
-writes = ["src/__init__.py", "src/api/", "src/domain/", "src/infra/", "migrations/", ".env.example", "spec/20_arch/env-contract.yaml"]
+# La documentacion operativa raiz es un entregable de implementacion. Mantenerla
+# bajo un task_node permite que el planner satisfaga acceptance_of_done sin crear
+# un nodo docs especial ni asignar archivos fuera de propiedad.
+writes = ["README.md", "src/__init__.py", "src/api/", "src/domain/", "src/infra/", "migrations/", ".env.example", "spec/20_arch/env-contract.yaml"]
 gates = ["G7", "G0", "G4", "G5", "G6", "R2"]
 next = "task_loop"
 

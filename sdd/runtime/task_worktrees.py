@@ -21,6 +21,52 @@ def _safe(value: object) -> str:
     return clean or "task"
 
 
+def _merge_in_progress(path: Path) -> bool:
+    return _git(path, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+
+
+def _abort_merge(path: Path, task_id: object) -> None:
+    if not _merge_in_progress(path):
+        return
+    aborted = _git(path, "merge", "--abort")
+    if aborted.returncode != 0:
+        raise RuntimeError(
+            f"no se pudo limpiar merge inconcluso de {task_id}: {_text(aborted)}")
+
+
+def _refresh_worktree(path: Path, main_head: str, task_id: object) -> None:
+    """Incorpora la rama aprobada y recupera conflictos de un intento rojo.
+
+    La rama principal ya contiene cambios que aprobaron sus gates. Ante un
+    conflicto con el candidato fallido preservado en el worktree, esa version
+    aprobada es la autoridad. Los cambios locales no preservados nunca se pisan.
+    """
+    _abort_merge(path, task_id)
+    dirty = (_git(path, "diff", "--quiet").returncode != 0
+             or _git(path, "diff", "--cached", "--quiet").returncode != 0)
+    if dirty:
+        raise RuntimeError(
+            f"worktree de {task_id} contiene cambios versionados sin preservar")
+
+    merge = _git(path, "merge", "--no-edit", main_head)
+    if merge.returncode == 0:
+        return
+    first_error = _text(merge)
+    if not _merge_in_progress(path):
+        raise RuntimeError(
+            f"no se pudo actualizar worktree de {task_id}: {first_error}")
+
+    _abort_merge(path, task_id)
+    recovered = _git(path, "merge", "--no-edit", "-X", "theirs", main_head)
+    if recovered.returncode == 0:
+        return
+    recovery_error = _text(recovered)
+    _abort_merge(path, task_id)
+    raise RuntimeError(
+        f"no se pudo actualizar worktree de {task_id}: {first_error}; "
+        f"recuperacion: {recovery_error}")
+
+
 def _write_json(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pending = path.with_suffix(path.suffix + ".tmp")
@@ -69,10 +115,7 @@ def prepare(workdir: str, run_id: str, task: dict[str, object]) -> dict[str, obj
     if isinstance(workspace, dict):
         path = Path(str(workspace.get("path", "")))
         if path.exists() and (path / ".git").exists():
-            merge = _git(path, "merge", "--no-edit", main_head)
-            if merge.returncode != 0:
-                raise RuntimeError(
-                    f"no se pudo actualizar worktree de {task['id']}: {_text(merge)}")
+            _refresh_worktree(path, main_head, task["id"])
             workspace["base_commit"] = main_head
             workspace["head"] = _git(path, "rev-parse", "HEAD").stdout.decode().strip()
             return workspace

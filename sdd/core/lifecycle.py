@@ -63,24 +63,42 @@ def created(workdir: str | Path, task: dict[str, object]) -> None:
     manifest = _task_dir(workdir, str(task["id"])) / "manifest.json"
     if manifest.exists():
         return
+    agent = task.get("agent") if isinstance(task.get("agent"), dict) else {}
     _emit(workdir, str(task["id"]), {
         "event": "created",
         "node": str(task.get("node")),
         "kind": str(task.get("kind", "plan")),
         "depends_on": [str(d) for d in (task.get("depends_on") or [])],
         "deliverables": [str(d) for d in (task.get("deliverables") or [])],
+        "agent_id": str(agent.get("id") or ""),
+        "agent_name": str(agent.get("name") or ""),
+        "parent_agent_id": str(agent.get("parent_id") or ""),
+        "parent_task_id": str(task.get("parent_task_id") or ""),
+        "depth": int(task.get("depth", 0)),
+    })
+
+
+def delegated(workdir: str | Path, task_id: str, agent_id: str,
+              child_ids: list[str], reason: str) -> None:
+    """Registra que un agente principal dividio su unidad en hijos validados."""
+    _emit(workdir, task_id, {
+        "event": "delegated",
+        "agent_id": agent_id,
+        "child_ids": list(child_ids),
+        "reason": reason,
     })
 
 
 def started(workdir: str | Path, task_id: str, node: str,
             workspace: Optional[str] = None, batch_id: str = "",
-            attempt: int = 1) -> None:
+            attempt: int = 1, agent_id: str = "") -> None:
     _emit(workdir, task_id, {
         "event": "started",
         "node": node,
         "workspace": workspace,
         "batch_id": batch_id,
         "attempt": attempt,
+        "agent_id": agent_id,
     })
 
 
@@ -214,6 +232,11 @@ def summary(workdir: str | Path, task_id: str) -> dict[str, object]:
         if name == "created":
             states["node"] = ev.get("node")
             states["kind"] = ev.get("kind")
+            states["agent_id"] = ev.get("agent_id")
+            states["agent_name"] = ev.get("agent_name")
+            states["parent_agent_id"] = ev.get("parent_agent_id")
+            states["parent_task_id"] = ev.get("parent_task_id")
+            states["depth"] = ev.get("depth", 0)
             states["created"] = at
         elif name == "started":
             if states["created"] is None:
@@ -237,6 +260,10 @@ def summary(workdir: str | Path, task_id: str) -> dict[str, object]:
         elif name == "blocked":
             last_status = "blocked"
             states["blocked_by"] = ev.get("blocked_by")
+        elif name == "delegated":
+            last_status = "delegated"
+            states["child_ids"] = ev.get("child_ids") or []
+            states["delegation_reason"] = ev.get("reason")
         elif name == "escalated":
             last_status = "escalated"
         elif name == "integrated":

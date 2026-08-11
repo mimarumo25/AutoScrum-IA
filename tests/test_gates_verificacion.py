@@ -323,6 +323,20 @@ class TestG10Plan(RepoCase):
         self.w("spec/30_plan/tasks.yaml", self.PLAN_OK)
         self.assertEqual(self._g10(), [])
 
+    def test_readme_raiz_es_entregable_valido_de_backend(self):
+        plan = self.PLAN_OK.replace(
+            "deliverables: [src/domain/x.py]",
+            "deliverables: [src/domain/x.py, README.md]",
+        )
+        self.w("spec/30_plan/tasks.yaml", plan)
+        self.assertEqual(self._g10(), [])
+
+    def test_prompt_consolida_documentacion_en_readme_raiz(self):
+        prompt = (ROOT / "agents/planner.md").read_text(encoding="utf-8")
+        self.assertIn("consolidala\n   en README.md en la raiz", prompt)
+        self.assertIn("no crees src/README.md", prompt)
+        self.assertIn("fr_refs validos", prompt)
+
     def test_ciclo_de_dependencias_es_detectado(self):
         self.w("spec/30_plan/tasks.yaml", self.PLAN_OK.replace(
             "depends_on: []", "depends_on: [T-002]"))

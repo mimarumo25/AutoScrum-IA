@@ -22,6 +22,7 @@ Codigos de salida:
   3  el agente se declara BLOQUEADO: le falta un insumo que no puede fabricar.
      El orquestador escala a humano en vez de reintentar a ciegas. Esto existe
      porque el frontend, al no encontrar backend, se invento un mock y siguio.
+  4  el agente principal propuso subtareas; el orquestador debe validarlas.
 """
 import json
 import os
@@ -33,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sdd.core import chronicle, config, lifecycle  # noqa: E402
 from sdd.integrations import model_router, providers  # noqa: E402
+from sdd.runtime import delegation  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 try:
@@ -87,6 +89,28 @@ salir del paso: responde con una sola linea
 <<<BLOCKED: que falta y quien deberia producirlo>>>
 
 Un mock que tapa un entregable ausente convierte un fallo visible en uno invisible.
+
+DIVIDE Y VENCERAS. Si tu tarea activa indica delegation.allowed=true y contiene
+varios resultados verificables independientes, NO intentes resolverlos todos en
+una sola llamada. En vez de archivos, responde exclusivamente con JSON estricto:
+
+<<<DELEGATE>>>
+{{
+  "reason": "por que la unidad debe dividirse",
+  "subtasks": [
+    {{"key": "S1", "title": "resultado pequeno", "node": "tu_rol",
+      "fr_refs": ["FR-001"], "deliverables": ["ruta/del/padre"],
+      "depends_on": [], "acceptance": "resultado observable", "scope": "dominio"}},
+    {{"key": "S2", "title": "segundo resultado", "node": "tu_rol",
+      "fr_refs": ["FR-001"], "deliverables": ["otra/ruta/del/padre"],
+      "depends_on": ["S1"], "acceptance": "resultado observable", "scope": "dominio"}}
+  ]
+}}
+<<<END_DELEGATE>>>
+
+Cada entregable hijo debe estar dentro de los entregables del padre y pertenecer
+al nodo asignado. No mezcles bloques FILE y DELEGATE. El orquestador rechazara
+ciclos, rutas nuevas, cobertura incompleta o exceso de profundidad.
 """
 
 
@@ -214,11 +238,16 @@ def gather_task(workdir: Path):
         return "", []
     lines = [
         "TU TAREA ASIGNADA (no implementes nada fuera de ella):",
+        f"  identidad:   {(t.get('agent') or {}).get('name', '(sin identidad)')}",
+        f"  agent_id:    {(t.get('agent') or {}).get('id', '(sin identidad)')}",
+        f"  parent_agent:{(t.get('agent') or {}).get('parent_id') or '(orquestador)'}",
+        f"  profundidad: {t.get('depth', 0)}",
         f"  task_id:     {t.get('id')}",
         f"  titulo:      {t.get('title')}",
         f"  FR cubiertos: {', '.join(t.get('fr_refs') or []) or '(ninguno)'}",
         f"  entregables: {', '.join(t.get('deliverables') or []) or '(los que exija el criterio)'}",
         f"  aceptacion:  {t.get('acceptance')}",
+        f"  delegacion:  {json.dumps(t.get('delegation') or {}, ensure_ascii=False)}",
     ]
     feedback = str(t.get("evaluation_feedback") or "").strip()
     if feedback:
@@ -312,6 +341,11 @@ def main():
         return 3
     runtime_cfg = config.load()
     task_data = active_task(workdir)
+    runtime_identity = (
+        task_data.get("agent")
+        if isinstance(task_data.get("agent"), dict)
+        else delegation.identity("linear", node)
+    )
     try:
         selection = model_router.resolve_agent(node, task_data, runtime_cfg)
     except model_router.ModelRoutingError as error:
@@ -339,6 +373,8 @@ def main():
     task_text, extra_globs = gather_task(workdir)
 
     user = "\n".join(filter(None, [
+        "TU IDENTIDAD DE EJECUCION:\n" +
+        json.dumps(runtime_identity, ensure_ascii=False, indent=2),
         f"IDEA (spec/00_intake.yaml, unica fuente de verdad):\n{intake}",
         task_text,
         f"ESPECIFICACION RELEVANTE PARA TU ROL:\n{gather_specs(workdir, node, extra_globs)}",
@@ -368,6 +404,36 @@ def main():
                       written=[], skipped=[], returncode=1,
                       detail=f"{type(e).__name__}: {e}", selection=selection)
         return 1
+
+    try:
+        proposal = delegation.parse_proposal(text)
+    except delegation.DelegationError as error:
+        print(f"  [agent] delegacion invalida: {error}", file=sys.stderr)
+        _archive_call(workdir, node, system_prompt, user, text,
+                      written=[], skipped=[], returncode=1,
+                      detail=str(error), selection=selection)
+        return 1
+    if proposal is not None:
+        authority = task_data.get("delegation") or {}
+        if FILE_BLOCK.search(text):
+            detail = "la respuesta mezcla bloques FILE y DELEGATE"
+        elif not authority.get("allowed"):
+            detail = "la tarea activa no tiene autoridad para delegar"
+        else:
+            detail = ""
+        if detail:
+            print(f"  [agent] delegacion rechazada: {detail}", file=sys.stderr)
+            _archive_call(workdir, node, system_prompt, user, text,
+                          written=[], skipped=[], returncode=1,
+                          detail=detail, selection=selection)
+            return 1
+        delegation.write_proposal(workdir, proposal)
+        _archive_call(workdir, node, system_prompt, user, text,
+                      written=[], skipped=[], returncode=delegation.RETURN_CODE,
+                      detail="propuesta de subtareas persistida", selection=selection)
+        print(f"  [agent] DELEGA {len(proposal.get('subtasks') or [])} subtareas",
+              flush=True)
+        return delegation.RETURN_CODE
 
     blocked = BLOCKED_BLOCK.search(text)
     if blocked and not FILE_BLOCK.search(text):

@@ -162,6 +162,13 @@ def env_for(provider: str, model: str, key: str):
     return env
 
 
+def _autonomous(body: dict) -> bool:
+    value = body.get("autonomous", False)
+    if not isinstance(value, bool):
+        raise ValueError("autonomous debe ser boolean")
+    return value
+
+
 def resume(body):
     project, task = (
         body.get("project", "").strip(),
@@ -176,9 +183,10 @@ def resume(body):
     env["SDD_APPROVAL_ACTOR"] = "web"
     decision = str(body.get("decision") or "")
     feedback = str(body.get("feedback") or "").strip()
+    autonomous = _autonomous(body)
     checkpoint = json.loads((workdir / ".agent/state.json").read_text(encoding="utf-8"))
     if checkpoint.get("status") == "waiting_human" and decision not in {
-            "accept", "reject"}:
+            "accept", "reject"} and not autonomous:
         raise ValueError("decision accept o reject es obligatoria para revision humana")
     if decision and decision not in {"accept", "reject"}:
         raise ValueError("decision debe ser accept o reject")
@@ -192,6 +200,7 @@ def resume(body):
         provider=provider,
         project=project,
         task=task,
+        autonomous=autonomous,
         failure=None,
         activity=state.activity(
             "starting",
@@ -201,6 +210,8 @@ def resume(body):
         ),
     )
     extra = ["--resume"]
+    if autonomous:
+        extra.append("--autonomous")
     if decision:
         extra.extend(("--human-decision", decision))
     if feedback:
@@ -215,6 +226,7 @@ def start(body):
     provider, key = body.get("provider", "anthropic"), body.get("key", "")
     model, project = body.get("model", "").strip(), body.get("project", "").strip()
     task = body.get("task", "").strip() or "tarea-1"
+    autonomous = _autonomous(body)
     config.save(
         {"provider": provider, "model": model, "keys": {provider: key} if key else {}}
     )
@@ -228,6 +240,7 @@ def start(body):
         provider=provider,
         project=project,
         task=task,
+        autonomous=autonomous,
         failure=None,
         activity=state.activity(
             "starting",
@@ -236,7 +249,9 @@ def start(body):
             "Inicializando Product Strategist y el contexto del proyecto",
         ),
     )
+    extra = ("--autonomous",) if autonomous else ()
     threading.Thread(
-        target=run_pipeline, args=(workdir, env_for(provider, model, key)), daemon=True
+        target=run_pipeline, args=(workdir, env_for(provider, model, key), extra),
+        daemon=True,
     ).start()
     return workdir

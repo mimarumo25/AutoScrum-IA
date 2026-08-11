@@ -344,7 +344,7 @@ SDD_PROMPT_CACHE
 
 La selección respeta, en orden, el override explícito del perfil, el proveedor global y la prioridad configurada. Los modelos sin credencial o sin tier clasificado no entran al routing automático. Si falta el tier solicitado se usa el mejor candidato configurado y se registra `fallback_reason`; si no hay ninguna credencial válida, la invocación falla inmediatamente.
 
-R1/R2 tienen un perfil independiente y prefieren un proveedor `frontier` distinto al autor. `SDD_REVIEW_MODEL` continúa siendo compatible y puede combinarse con `SDD_REVIEW_PROVIDER`. El fallo del revisor conserva el comportamiento fail-open documentado; los gates deterministas mantienen autoridad.
+R1/R2 tienen un perfil independiente y prefieren un proveedor `frontier` distinto al autor. `SDD_REVIEW_MODEL` continúa siendo compatible y puede combinarse con `SDD_REVIEW_PROVIDER`. El fallo del revisor es fail-closed (proveedor ausente, excepción o salida ilegible producen hallazgo, nunca un aprobado silencioso); los gates deterministas mantienen autoridad.
 
 El catálogo se actualiza con `POST /models/discover`. El último catálogo válido permanece en `config.json`. Un modelo nuevo recibe su tier con la misma función que usa el runtime (`classify_model`), de modo que el catálogo y la ejecución nunca afirman tiers distintos sobre el mismo modelo; un tier fijado a mano en `config.json` siempre gana. `GET /routing/preview` expone decisiones y candidatos deshabilitados, nunca API keys.
 ## Configuración de agentes

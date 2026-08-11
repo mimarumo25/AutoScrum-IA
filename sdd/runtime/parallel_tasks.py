@@ -5,7 +5,7 @@ import os
 from langgraph.types import Send
 
 from sdd.core import lifecycle
-from sdd.runtime import plan_analysis, scrum, task_worktrees, taskqueue
+from sdd.runtime import delegation, plan_analysis, scrum, task_worktrees, taskqueue
 from sdd.runtime.artifact_integrity import allowed_roots, evaluation_matches
 
 
@@ -51,13 +51,20 @@ class ParallelTasks:
 
     def load_reconcile(self, value):
         current = self.normalize(copy.deepcopy(dict(value)))
+        for task in current["tasks"]:
+            delegation.ensure_identity(task)
+            if "delegation" not in task:
+                delegation.allow_delegation(
+                    task, int(self.cfg.get("budget", {}).get(
+                        "max_delegation_depth", delegation.DEFAULT_MAX_DEPTH)))
         reconciled = set(taskqueue.reconcile_completed_defects(current["tasks"]))
+        reconciled.update(delegation.rollup(current["tasks"], self.workdir))
         for task in current["tasks"]:
             if str(task["id"]) in reconciled:
                 task_worktrees.cleanup(self.workdir, task)
         if not current["tasks"]:
             try:
-                current["tasks"] = taskqueue.load_plan(self.workdir)
+                current["tasks"] = taskqueue.load_plan(self.workdir, self.cfg)
             except taskqueue.PlanError as error:
                 current["status"] = "escalated"
                 current["schedule_route"] = "terminal"
@@ -189,6 +196,7 @@ class ParallelTasks:
         return {
             "awaiting_human": "review",
             "done": "integrate",
+            "delegated": "delegate",
             "blocked": "defect",
         }.get(str(result.get("outcome")), "escalate")
 
@@ -210,6 +218,9 @@ class ParallelTasks:
 
     def integrate_result(self, value):
         return self._consume_result(value, "integrate")
+
+    def delegate_result(self, value):
+        return self._consume_result(value, "delegate")
 
     def defect_result(self, value):
         return self._consume_result(value, "defect")
@@ -246,6 +257,39 @@ class ParallelTasks:
             raise RuntimeError(f"tarea ausente al colectar: {task_id}")
         if not result.get("collected"):
             self._stage_review(current, result)
+
+        if result["outcome"] == "delegated":
+            try:
+                children = delegation.apply_proposal(
+                    current["tasks"], task, result.get("decomposition") or {},
+                    self.nodes, self.cfg, self.workdir)
+            except delegation.DelegationError as error:
+                reason = f"delegacion rechazada: {error}"
+                taskqueue.mark_needs_input(
+                    current["tasks"], task_id, reason, "G-DELEGATION")
+                self.log_fn(current, "RAMA_EN_ESPERA", tarea=task_id,
+                            nodo=task.get("node", ""), gate="G-DELEGATION",
+                            motivo=reason)
+                task_worktrees.cleanup(self.workdir, task)
+                return True
+            parent_agent = task.get("agent") or {}
+            self.log_fn(
+                current, "TAREA_DIVIDIDA", tarea=task_id,
+                nodo=task.get("node", ""), agente=parent_agent.get("id", ""),
+                hijos=",".join(str(child["id"]) for child in children),
+                motivo=task.get("delegation_reason", ""),
+            )
+            for child in children:
+                child_agent = child.get("agent") or {}
+                self.log_fn(
+                    current, "AGENTE_DELEGA", tarea=task_id,
+                    nodo=task.get("node", ""), a=child.get("node", ""),
+                    agente=parent_agent.get("id", ""),
+                    agente_hijo=child_agent.get("id", ""),
+                    subtarea=child.get("id", ""),
+                )
+            task_worktrees.cleanup(self.workdir, task)
+            return True
 
         if result["outcome"] == "done":
             node = self.nodes[str(task["node"])]

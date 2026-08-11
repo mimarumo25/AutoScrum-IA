@@ -170,8 +170,11 @@ def run(a):
     print(f"proyecto en: {wd}")
     if _seed_repo(wd, a.intake) is None:
         return 1
-    return subprocess.run([PY, "-m", "sdd.runtime.orchestrator",
-                           "--workdir", str(wd), "--task", a.task]).returncode
+    cmd = [PY, "-m", "sdd.runtime.orchestrator",
+           "--workdir", str(wd), "--task", a.task]
+    if getattr(a, "autonomous", False):
+        cmd.append("--autonomous")
+    return subprocess.run(cmd).returncode
 
 
 def resume(a):
@@ -185,7 +188,8 @@ def resume(a):
     state_path = Path(a.workdir) / ".agent/state.json"
     if state_path.exists():
         checkpoint = json.loads(state_path.read_text(encoding="utf-8"))
-        if checkpoint.get("status") == "waiting_human" and not decision:
+        if (checkpoint.get("status") == "waiting_human" and not decision
+                and not getattr(a, "autonomous", False)):
             print("una espera humana requiere --decision accept|reject")
             return 2
     if decision:
@@ -602,6 +606,8 @@ def build_parser():
     s.add_argument("--project", default=None, help="nombre → project/<nombre> (o config)")
     s.add_argument("--workdir", default=None, help="ruta explícita (anula --project)")
     s.add_argument("--intake", default=None, help="archivo de idea (default: ./intake.yaml)")
+    s.add_argument("--autonomous", action="store_true",
+                   help="continúa sin revisiones humanas tras superar los gates")
     s.add_argument("--task", default="Ejecutar el plan de spec/30_plan/tasks.yaml"); s.set_defaults(fn=run)
     s = sub.add_parser("doctor"); s.set_defaults(fn=doctor)
     s = sub.add_parser("config"); s.set_defaults(fn=config_cmd)

@@ -6,7 +6,7 @@ from sdd.runtime.workflow_contracts import DefectDecision, Finding
 
 ENVIRONMENT_RULES = {
     "toolchain-no-disponible", "entorno-sin-red", "suite-colgada",
-    "revision-no-disponible",
+    "revision-no-disponible", "proveedor-no-disponible",
 }
 
 

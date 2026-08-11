@@ -32,11 +32,15 @@ REGLAS DEL DAG
 5. depends_on solo expresa consumo real de un artefacto. Sin ciclos ni dependencias
    decorativas. Frontend y backend pueden trabajar en paralelo contra OpenAPI firmado.
 6. El arquitecto ya creo manifiestos y configuracion raiz: nunca los asignes a Dev.
-7. Una tarea cabe en una llamada: una responsabilidad, entre uno y cuatro archivos,
+7. Si acceptance_of_done exige documentacion de instalacion o ejecucion, consolidala
+   en README.md en la raiz y asignala a dev_backend, que posee esa ruta. Incluyela en
+   una tarea funcional con fr_refs validos; no crees src/README.md ni una tarea docs
+   separada con fr_refs vacio.
+8. Una tarea cabe en una llamada: una responsabilidad, entre uno y cuatro archivos,
    objetivo <=300 lineas por archivo y limite duro de 500. Divide por dominio.
-8. QA es exactamente una tarea que depende de todas las tareas de codigo y cubre
+9. QA es exactamente una tarea que depende de todas las tareas de codigo y cubre
    escenarios @critical, pruebas unitarias, contrato/integracion y E2E.
-9. Orden recomendado: dominio, infraestructura, API, frontend y QA, sin serializar
+10. Orden recomendado: dominio, infraestructura, API, frontend y QA, sin serializar
    tareas independientes.
 
 INTEGRIDAD

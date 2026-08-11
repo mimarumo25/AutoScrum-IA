@@ -28,7 +28,8 @@ def normalize(state: PipelineState) -> PipelineState:
         "recovery_seq": 0, "active_visit": None, "batch_seq": 0,
         "parallel_batch": None, "parallel_results": {}, "worker_task_id": None,
         "human_approvals": [], "human_decision": None, "generation": None,
-        "evaluation": None, "pending_review": None, "defect_decision": None,
+        "evaluation": None, "decomposition": None, "pending_review": None,
+        "defect_decision": None,
         "feedback": "", "retry_count": 0, "iterations": [],
         "work_unit_started": False, "work_unit_error": "",
     }

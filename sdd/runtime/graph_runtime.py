@@ -406,6 +406,8 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
         value, parallel.defer_review(value)))
     builder.add_node("integrate_result", lambda value: _delta(
         value, parallel.integrate_result(value)))
+    builder.add_node("delegate_result", lambda value: _delta(
+        value, parallel.delegate_result(value)))
     builder.add_node("defect_result", lambda value: _delta(
         value, parallel.defect_result(value)))
     builder.add_node("escalate_result", lambda value: _delta(
@@ -429,11 +431,12 @@ def run_pipeline(state: dict[str, object], state_path: Path, args: object,
     builder.add_edge("parallel_collect", "route_batch")
     builder.add_conditional_edges("route_batch", parallel.route_batch, {
         "review": "defer_review", "integrate": "integrate_result",
+        "delegate": "delegate_result",
         "defect": "defect_result", "escalate": "escalate_result",
         "finish": "finish_batch",
     })
-    for result_node in ("defer_review", "integrate_result", "defect_result",
-                        "escalate_result"):
+    for result_node in ("defer_review", "integrate_result", "delegate_result",
+                        "defect_result", "escalate_result"):
         builder.add_edge(result_node, "route_batch")
     builder.add_edge("finish_batch", "bootstrap")
 
