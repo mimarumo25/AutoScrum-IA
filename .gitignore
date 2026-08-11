@@ -8,6 +8,25 @@ __pycache__/
 config.json
 project/
 
+# Secretos y config local. .env.example SI se versiona (documenta el contrato).
+.env
+.env.*
+!.env.example
+
+# Cache local de skill-registry, no es codigo del proyecto.
+.atl/
+
+# Config local de Claude Code (permisos de esta maquina, no del proyecto).
+.claude/settings.local.json
+
+# Cache/scratch local sin relacion con el proyecto.
+.codex-tmp/
+
+# Contenido interno sin relacion con el codigo del proyecto (branding, informes
+# de viabilidad de negocio). No se publican en el repo abierto.
+branding-propuestas/
+docs/informe-viabilidad-gentle-ai-ponytail*.md
+
 # Artefactos de ejecuciones y pruebas locales. No son codigo del proyecto:
 # contienen repos de fixture (src/domain/matricula.py, worktrees, locks) que
 # el indexador de codebase-memory tomaria como simbolos reales y contaminarian
@@ -25,3 +44,4 @@ project/
 pytest-cache-files-*/
 tmp*/
 output/
+
